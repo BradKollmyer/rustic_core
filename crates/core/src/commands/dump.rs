@@ -1,4 +1,4 @@
-use std::{io::Write, thread::scope};
+use std::{collections::BTreeSet, io::Write, thread::scope};
 
 use pariter::IteratorExt;
 
@@ -43,6 +43,14 @@ pub(crate) fn dump<S: IndexedFull>(
     let Some(content) = node.content.as_ref() else {
         return Ok(());
     };
+
+    let packs: Vec<_> = content
+        .iter()
+        .filter_map(|id| repo.index().get_data(id).map(|ie| ie.pack))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    repo.warm_up_wait(packs.into_iter())?;
 
     // Single-blob files have nothing to overlap, so skip the worker setup.
     if content.len() < 2 {

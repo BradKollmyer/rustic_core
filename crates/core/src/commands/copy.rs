@@ -88,6 +88,14 @@ pub(crate) fn copy<'a, R: IndexedFull, S: IndexedIds>(
         }
     }
 
+    let data_packs: Vec<_> = data_ids
+        .iter()
+        .filter_map(|id| index.get_data(id).map(|entry| entry.pack))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    repo.warm_up_wait(data_packs.into_iter())?;
+
     let indexer = Indexer::new(be_dest.clone()).into_shared();
 
     let p = repo_dest.progress_bytes("copying data blobs...");

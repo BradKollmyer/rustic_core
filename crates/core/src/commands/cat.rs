@@ -65,6 +65,11 @@ pub(crate) fn cat_blob<S: IndexedFull>(
     id: &str,
 ) -> RusticResult<Bytes> {
     let id = id.parse()?;
+    if tpe == BlobType::Data
+        && let Some(ie) = repo.index().get_id(tpe, &id)
+    {
+        repo.warm_up_wait(std::iter::once(ie.pack))?;
+    }
     let data = repo.index().blob_from_backend(repo.dbe(), tpe, &id)?;
 
     Ok(data)

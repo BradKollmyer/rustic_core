@@ -7,6 +7,7 @@ pub use status::*;
 
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -64,6 +65,7 @@ use crate::{
         ConfigFile, KeyId, PathList, RepoFile, RepoId, SnapshotFile, SnapshotSummary, Tree,
         configfile::ConfigId,
         keyfile::{MasterKey, find_key_in_backend},
+        packfile::PackId,
         snapshotfile::SnapshotId,
     },
     repository::{
@@ -641,7 +643,7 @@ impl<S> Repository<S> {
     ///
     /// * If the command could not be parsed.
     /// * If the thread pool could not be created.
-    pub(crate) fn warm_up_wait<I: RepoId>(
+    pub fn warm_up_wait<I: RepoId>(
         &self,
         ids: impl ExactSizeIterator<Item = I> + Clone,
     ) -> RusticResult<()> {
@@ -1791,6 +1793,31 @@ impl<S: IndexedFull> Repository<S> {
     /// Currently, only regular file nodes are supported.
     pub fn dump(&self, node: &Node, w: &mut impl Write) -> RusticResult<()> {
         commands::dump::dump(self, node, w)
+    }
+
+    /// Collect pack files that store the file contents of the given nodes.
+    ///
+    /// Use this to warm data packs before restore, dump, or similar reads when
+    /// there is no restore destination to compare against.
+    ///
+    /// # Errors
+    ///
+    /// * If a blob listed in a file node is not in the index.
+    pub fn packs_for_nodes(
+        &self,
+        nodes: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
+    ) -> RusticResult<Vec<PackId>> {
+        let mut packs = BTreeSet::new();
+        for item in nodes {
+            let (_, node) = item?;
+            if !node.is_file() {
+                continue;
+            }
+            for id in node.content.iter().flatten() {
+                _ = packs.insert(self.get_index_entry(id)?.pack);
+            }
+        }
+        Ok(packs.into_iter().collect())
     }
 
     /// Prepare the restore.
