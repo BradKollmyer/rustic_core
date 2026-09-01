@@ -1,0 +1,9 @@
+path = "s3"
+[options]
+region = "eu-central-1"
+bucket = "bucket_name"
+root = "/path/to/repo"
+data_storage_class = "DEEP_ARCHIVE"
+enable_restore = "false"
+restore_days = "7"
+restore_tier = "Standard"

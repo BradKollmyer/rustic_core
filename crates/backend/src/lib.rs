@@ -64,6 +64,11 @@ pub mod util;
 #[cfg(feature = "reqwest")]
 pub(crate) mod reqwest;
 
+#[cfg(feature = "opendal")]
+mod glacier;
+#[cfg(feature = "opendal")]
+mod s3_restore;
+
 /// `OpenDAL` backend for Rustic.
 #[cfg(feature = "opendal")]
 pub mod opendal;

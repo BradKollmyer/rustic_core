@@ -23,11 +23,13 @@ use typed_path::UnixPathBuf;
 
 use rustic_core::{
     ALL_FILE_TYPES, BytesList, ErrorKind, Excludes, FileType, Id, ReadBackend, ReadSource,
-    ReadSourceEntry, ReadSourceOpen, RusticError, RusticResult, WriteBackend,
+    ReadSourceEntry, ReadSourceOpen, RusticError, RusticResult, WarmupStatus, WriteBackend,
     repofile::{Node, NodeType},
 };
 
+use crate::glacier::GlacierConfig;
 use crate::reqwest::reqwest_client;
+use crate::s3_restore::S3Restore;
 
 mod constants {
     /// Default number of retries
@@ -38,6 +40,54 @@ mod constants {
 #[derive(Clone, Debug)]
 pub struct OpenDALBackend {
     operator: Operator,
+    /// Operator that applies `default_storage_class` to data packs only.
+    data_operator: Option<Operator>,
+    glacier: GlacierConfig,
+    s3_restore: Option<S3Restore>,
+}
+
+fn blocking_operator(
+    path: &str,
+    scheme: &str,
+    options: BTreeMap<String, String>,
+    max_retries: usize,
+    throttle: Option<Throttle>,
+    connections: Option<usize>,
+    client: reqwest::Client,
+) -> RusticResult<Operator> {
+    let http_transport = HttpTransporter::new(ReqwestTransport::new(client));
+    let operation_context = OperationContext::new().with_http_transport(http_transport);
+
+    let mut operator = opendal::Operator::via_iter(scheme, options)
+        .map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::Backend,
+                "Creating Operator from path `{path}` failed. Please check the given schema and options.",
+                err,
+            )
+            .attach_context("path", path)
+            .attach_context("schema", scheme)
+        })?
+        .with_context(operation_context)
+        .layer(RetryLayer::new().with_max_times(max_retries).with_jitter());
+
+    if let Some(Throttle { bandwidth, burst }) = throttle {
+        operator = operator.layer(ThrottleLayer::new(bandwidth, burst));
+    }
+
+    if let Some(connections) = connections {
+        operator = operator.layer(ConcurrentLimitLayer::new(connections));
+    }
+
+    let _guard = runtime().enter();
+    Operator::new(operator.layer(LoggingLayer::default())).map_err(|err| {
+        RusticError::with_source(
+            ErrorKind::Backend,
+            "Creating blocking Operator from path `{path}` failed.",
+            err,
+        )
+        .attach_context("path", path)
+    })
 }
 
 fn runtime() -> &'static Runtime {
@@ -116,6 +166,9 @@ impl OpenDALBackend {
     ///
     /// A new `OpenDAL` backend.
     pub fn new(path: impl AsRef<str>, options: BTreeMap<String, String>) -> RusticResult<Self> {
+        let mut options = options;
+        let glacier = GlacierConfig::extract(&mut options)?;
+
         let max_retries = match options.get("retry").map(String::as_str) {
             Some("false" | "off") => 0,
             None | Some("default") => constants::DEFAULT_RETRY,
@@ -148,8 +201,6 @@ impl OpenDALBackend {
             .transpose()?;
 
         let client = reqwest_client(&options)?;
-        let http_transport = HttpTransporter::new(ReqwestTransport::new(client));
-        let operation_context = OperationContext::new().with_http_transport(http_transport);
 
         let scheme = path
             .as_ref()
@@ -157,37 +208,57 @@ impl OpenDALBackend {
             .next()
             .unwrap_or_else(|| path.as_ref());
 
-        let mut operator = opendal::Operator::via_iter(scheme, options)
-            .map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::Backend,
-                    "Creating Operator from path `{path}` failed. Please check the given schema and options.",
-                    err,
-                )
-                .attach_context("path", path.as_ref().to_string())
-                .attach_context("schema", scheme.to_string())
-            })?.with_context(operation_context)
-            .layer(RetryLayer::new().with_max_times(max_retries).with_jitter());
+        let s3_restore = if scheme == "s3" {
+            S3Restore::from_options(&options, &glacier)?
+        } else {
+            None
+        };
 
-        if let Some(Throttle { bandwidth, burst }) = throttle {
-            operator = operator.layer(ThrottleLayer::new(bandwidth, burst));
+        let mut meta_opts = options.clone();
+        if glacier.data_storage_class.is_some() {
+            _ = meta_opts.remove("default_storage_class");
         }
 
-        if let Some(connections) = connections {
-            operator = operator.layer(ConcurrentLimitLayer::new(connections));
+        let operator = blocking_operator(
+            path.as_ref(),
+            scheme,
+            meta_opts,
+            max_retries,
+            throttle,
+            connections,
+            client.clone(),
+        )?;
+
+        let data_operator = if let Some(class) = &glacier.data_storage_class {
+            let mut data_opts = options;
+            _ = data_opts.insert("default_storage_class".to_string(), class.clone());
+            Some(blocking_operator(
+                path.as_ref(),
+                scheme,
+                data_opts,
+                max_retries,
+                throttle,
+                connections,
+                client,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            operator,
+            data_operator,
+            glacier,
+            s3_restore,
+        })
+    }
+
+    fn writer(&self, tpe: FileType, cacheable: bool) -> &Operator {
+        if tpe == FileType::Pack && !cacheable {
+            self.data_operator.as_ref().unwrap_or(&self.operator)
+        } else {
+            &self.operator
         }
-
-        let _guard = runtime().enter();
-        let operator = Operator::new(operator.layer(LoggingLayer::default())).map_err(|err| {
-            RusticError::with_source(
-                ErrorKind::Backend,
-                "Creating blocking Operator from path `{path}` failed.",
-                err,
-            )
-            .attach_context("path", path.as_ref().to_string())
-        })?;
-
-        Ok(Self { operator })
     }
 
     /// Return a path for the given file type and id.
@@ -461,6 +532,33 @@ impl ReadBackend for OpenDALBackend {
             .to_bytes())
     }
 
+    fn archive_class(&self) -> Option<&str> {
+        self.glacier.archive_class()
+    }
+
+    fn needs_warm_up(&self) -> bool {
+        self.s3_restore.is_some() && !self.glacier.is_instant_retrieval()
+    }
+
+    fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
+        if let Some(restore) = &self.s3_restore {
+            restore.restore_key(&self.warmup_path(tpe, id))?;
+        }
+        Ok(())
+    }
+
+    fn reports_warmup_status(&self) -> bool {
+        self.s3_restore.is_some()
+    }
+
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        if let Some(restore) = &self.s3_restore {
+            restore.status_key(&self.warmup_path(tpe, id))
+        } else {
+            Ok(WarmupStatus::Warm)
+        }
+    }
+
     fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
         // OpenDAL normalizes roots to format `/path/` (with leading and trailing slashes)
         // or just `/` for the storage root. We strip these slashes to get the root prefix
@@ -535,12 +633,12 @@ impl WriteBackend for OpenDALBackend {
         &self,
         tpe: FileType,
         id: &Id,
-        _cacheable: bool,
+        cacheable: bool,
         content: BytesList,
     ) -> RusticResult<()> {
-        trace!("writing tpe: {tpe:?}, id: {id}");
+        trace!("writing tpe: {tpe:?}, id: {id}, cacheable: {cacheable}");
         let filename = self.path(tpe, id);
-        _ = self.operator.write(&filename, content.into_vec()).map_err(|err| {
+        _ = self.writer(tpe, cacheable).write(&filename, content.into_vec()).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Backend,
                 "Writing file `{path}` failed in the backend. Please check if the given path is correct.",
@@ -652,6 +750,19 @@ mod tests {
             "warmup_path should not contain double slashes: {path}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn data_storage_class_sets_archive_class_and_data_operator() -> Result<()> {
+        let mut options = BTreeMap::new();
+        _ = options.insert("region".into(), "eu-central-1".into());
+        _ = options.insert("bucket".into(), "bucket_name".into());
+        _ = options.insert("root".into(), "/repo".into());
+        _ = options.insert("data_storage_class".into(), "GLACIER".into());
+        let backend = OpenDALBackend::new("s3", options)?;
+        assert_eq!(backend.archive_class(), Some("GLACIER"));
+        assert!(backend.data_operator.is_some());
         Ok(())
     }
 }
