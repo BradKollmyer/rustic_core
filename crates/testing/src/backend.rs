@@ -19,39 +19,65 @@ pub mod in_memory_backend {
         map: RwLock<EnumMap<FileType, BTreeMap<Id, Bytes>>>,
         is_cold: bool,
         warm: RwLock<EnumMap<FileType, BTreeSet<Id>>>,
+        archive_class: Option<String>,
+        /// After `warm_up`, this many `warmup_status` calls return `Warming` before `Warm`.
+        polls_until_warm: u32,
+        remaining_polls: RwLock<EnumMap<FileType, BTreeMap<Id, u32>>>,
     }
 
     impl Clone for InMemoryBackend {
         fn clone(&self) -> Self {
             let inner_map = self.map.read().unwrap();
             let inner_warm = self.warm.read().unwrap();
+            let inner_polls = self.remaining_polls.read().unwrap();
             Self {
                 map: RwLock::new(EnumMap::from_fn(|tpe| inner_map[tpe].clone())),
                 is_cold: self.is_cold,
                 warm: RwLock::new(EnumMap::from_fn(|tpe| inner_warm[tpe].clone())),
+                archive_class: self.archive_class.clone(),
+                polls_until_warm: self.polls_until_warm,
+                remaining_polls: RwLock::new(EnumMap::from_fn(|tpe| inner_polls[tpe].clone())),
             }
         }
     }
 
     impl InMemoryBackend {
+        fn empty(is_cold: bool) -> Self {
+            Self {
+                map: RwLock::new(EnumMap::from_fn(|_| BTreeMap::new())),
+                is_cold,
+                warm: RwLock::new(EnumMap::from_fn(|_| BTreeSet::new())),
+                archive_class: None,
+                polls_until_warm: 0,
+                remaining_polls: RwLock::new(EnumMap::from_fn(|_| BTreeMap::new())),
+            }
+        }
+
         /// Create a new (empty) `InMemoryBackend`
         #[must_use]
         pub fn new() -> Self {
-            Self {
-                map: RwLock::new(EnumMap::from_fn(|_| BTreeMap::new())),
-                is_cold: false,
-                warm: RwLock::new(EnumMap::from_fn(|_| BTreeSet::new())),
-            }
+            Self::empty(false)
         }
 
         /// Create a new (empty) cold `InMemoryBackend`
         #[must_use]
         pub fn new_cold() -> Self {
-            Self {
-                map: RwLock::new(EnumMap::from_fn(|_| BTreeMap::new())),
-                is_cold: true,
-                warm: RwLock::new(EnumMap::from_fn(|_| BTreeSet::new())),
-            }
+            Self::empty(true)
+        }
+
+        /// Cold backend whose `warmup_status` stays `Warming` for `polls` status checks after `warm_up`.
+        #[must_use]
+        pub fn new_cold_with_polls(polls: u32) -> Self {
+            let mut be = Self::empty(true);
+            be.polls_until_warm = polls;
+            be
+        }
+
+        /// Set a fake archive class so prune treats this backend like Glacier.
+        #[must_use]
+        pub fn with_archive_class(mut self, class: impl Into<String>) -> Self {
+            self.archive_class = Some(class.into());
+            self
         }
     }
 
@@ -139,7 +165,12 @@ pub mod in_memory_backend {
 
         fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
             if self.is_cold {
-                _ = self.warm.write().unwrap()[tpe].insert(*id);
+                if self.polls_until_warm == 0 {
+                    _ = self.warm.write().unwrap()[tpe].insert(*id);
+                } else {
+                    _ = self.remaining_polls.write().unwrap()[tpe]
+                        .insert(*id, self.polls_until_warm);
+                }
             }
             Ok(())
         }
@@ -149,11 +180,28 @@ pub mod in_memory_backend {
         }
 
         fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
-            if self.is_cold && !self.warm.read().unwrap()[tpe].contains(id) {
-                Ok(WarmupStatus::Cold)
-            } else {
-                Ok(WarmupStatus::Warm)
+            if !self.is_cold || self.warm.read().unwrap()[tpe].contains(id) {
+                return Ok(WarmupStatus::Warm);
             }
+            let mut remaining = self.remaining_polls.write().unwrap();
+            if let Some(left) = remaining[tpe].get_mut(id) {
+                if *left == 0 {
+                    _ = self.warm.write().unwrap()[tpe].insert(*id);
+                    return Ok(WarmupStatus::Warm);
+                }
+                *left -= 1;
+                if *left == 0 {
+                    _ = remaining[tpe].remove(id);
+                    _ = self.warm.write().unwrap()[tpe].insert(*id);
+                    return Ok(WarmupStatus::Warm);
+                }
+                return Ok(WarmupStatus::Warming);
+            }
+            Ok(WarmupStatus::Cold)
+        }
+
+        fn archive_class(&self) -> Option<&str> {
+            self.archive_class.as_deref()
         }
     }
 

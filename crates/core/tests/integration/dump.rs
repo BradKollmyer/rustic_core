@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::PathBuf, str::FromStr};
+use std::{fs, io::Write, path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use bytesize::ByteSize;
@@ -7,9 +7,11 @@ use rstest::rstest;
 use tempfile::tempdir;
 
 use rustic_core::{
-    BackupOptions, ConfigOptions, IndexedFullStatus, PathList, Repository,
+    BackupOptions, BlobType, ConfigOptions, Credentials, FileType, IndexedFullStatus, KeyOptions,
+    PathList, ReadBackend, Repository, RepositoryBackends, RepositoryOptions,
     repofile::{Chunker, SnapshotFile},
 };
+use rustic_testing::backend::in_memory_backend::InMemoryBackend;
 
 use super::{RepoOpen, set_up_repo};
 
@@ -76,5 +78,39 @@ fn test_dump_default_options_match_source(set_up_repo: Result<RepoOpen>) -> Resu
     let mut out = Vec::new();
     repo.dump(&node, &mut out)?;
     assert_eq!(out, data);
+    Ok(())
+}
+
+#[test]
+fn test_dump_and_cat_warm_cold_data_packs() -> Result<()> {
+    let be_hot = InMemoryBackend::new();
+    let be_cold = Arc::new(InMemoryBackend::new_cold());
+    let be = RepositoryBackends::new(be_cold.clone(), Some(Arc::new(be_hot)));
+    let repo = Repository::new(&RepositoryOptions::default(), &be)?.init(
+        &Credentials::password("test"),
+        &KeyOptions::default(),
+        &ConfigOptions::default(),
+    )?;
+    let data = payload(8 * 1024);
+    let (repo, snapshot_path) = backup_single_file(repo, "file.bin", &data)?;
+    let node = repo.node_from_snapshot_path(&snapshot_path, |_| true)?;
+
+    let cold_packs = be_cold.list(FileType::Pack)?;
+    assert!(
+        !cold_packs.is_empty(),
+        "expected data packs on the cold backend"
+    );
+    assert!(
+        be_cold.read_full(FileType::Pack, &cold_packs[0]).is_err(),
+        "cold data pack should not be readable before dump warmup"
+    );
+
+    let mut out = Vec::new();
+    repo.dump(&node, &mut out)?;
+    assert_eq!(out, data);
+
+    let blob_id = node.content.as_ref().expect("file content")[0];
+    let blob = repo.cat_blob(BlobType::Data, blob_id.to_hex().as_str())?;
+    assert!(!blob.is_empty());
     Ok(())
 }

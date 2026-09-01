@@ -1,10 +1,14 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 
-use rustic_core::{BackupOptions, CheckOptions, CopySnapshot, repofile::SnapshotFile};
+use rustic_core::{
+    BackupOptions, CheckOptions, ConfigOptions, CopySnapshot, Credentials, KeyOptions, Repository,
+    RepositoryBackends, RepositoryOptions, repofile::SnapshotFile,
+};
+use rustic_testing::backend::in_memory_backend::InMemoryBackend;
 
 use super::{RepoOpen, TestSource, set_up_repo, tar_gz_testdata};
 
@@ -42,5 +46,29 @@ fn test_copy(tar_gz_testdata: Result<TestSource>, set_up_repo: Result<RepoOpen>)
     let check_opts = CheckOptions::default();
     target.check(check_opts)?.is_ok()?;
 
+    Ok(())
+}
+
+#[rstest]
+fn test_copy_warms_cold_source_data_packs(tar_gz_testdata: Result<TestSource>) -> Result<()> {
+    let source = tar_gz_testdata?;
+    let be_hot = InMemoryBackend::new();
+    let be_cold = InMemoryBackend::new_cold();
+    let be = RepositoryBackends::new(Arc::new(be_cold), Some(Arc::new(be_hot)));
+    let repo = Repository::new(&RepositoryOptions::default(), &be)?
+        .init(
+            &Credentials::password("test"),
+            &KeyOptions::default(),
+            &ConfigOptions::default(),
+        )?
+        .to_indexed_ids()?;
+
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let snap = repo.backup(&opts, &source.path_list(), SnapshotFile::default())?;
+    let repo = repo.to_indexed()?;
+
+    let target = set_up_repo()?.to_indexed_ids()?;
+    repo.copy(&target, Some(&snap))?;
+    target.check(CheckOptions::default())?.is_ok()?;
     Ok(())
 }

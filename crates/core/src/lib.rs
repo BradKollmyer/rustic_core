@@ -145,7 +145,7 @@ pub use crate::{
         stdin::StdinSource,
     },
     blob::{
-        BlobId, DataId, PackedId,
+        BlobId, BlobType, DataId, PackedId,
         tree::{
             FindMatches, FindNode, TreeId, TreeStreamerOptions as LsOptions, excludes::Excludes,
             rewrite::RewriteTreesOptions,

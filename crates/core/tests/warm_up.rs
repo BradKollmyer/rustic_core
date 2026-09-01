@@ -938,3 +938,17 @@ fn test_cold_backend_warm_up_marks_packs_warm() -> Result<()> {
     repo.require_warm(ids.into_iter())?;
     Ok(())
 }
+
+#[test]
+fn test_warm_up_wait_polls_until_status_is_warm() -> Result<()> {
+    let be = InMemoryBackend::new_cold_with_polls(2);
+    let wait: jiff::SignedDuration = "1s".parse()?;
+    let repo = rustic_core::Repository::new(
+        &RepositoryOptions::default().warm_up_wait(wait),
+        &RepositoryBackends::new(Arc::new(be), None),
+    )?;
+    let ids = create_test_ids(1);
+    repo.warm_up_wait(ids.iter().copied())?;
+    repo.require_warm(ids.into_iter())?;
+    Ok(())
+}

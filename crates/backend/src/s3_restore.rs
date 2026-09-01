@@ -108,6 +108,23 @@ pub(crate) struct S3Restore {
     restore_tier: String,
 }
 
+#[cfg(test)]
+impl S3Restore {
+    fn with_transport(transport: Arc<dyn S3Transport>) -> Self {
+        Self {
+            transport,
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            host: "s3.us-east-1.amazonaws.com".into(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+            restore_days: 7,
+            restore_tier: "Standard".into(),
+        }
+    }
+}
+
 impl std::fmt::Debug for S3Restore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Restore")
@@ -432,5 +449,113 @@ mod tests {
             WarmupStatus::Warm
         );
         assert_eq!(status_from_headers(None, None), WarmupStatus::Warm);
+    }
+
+    #[derive(Default)]
+    struct FakeS3 {
+        restore_status: u16,
+        restore_calls: std::sync::Mutex<Vec<(String, Vec<String>, Vec<u8>)>>,
+        head: HeadResult,
+    }
+
+    impl S3Transport for FakeS3 {
+        fn restore(&self, url: &str, headers: HeaderMap, body: &[u8]) -> RusticResult<u16> {
+            let names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+            self.restore_calls
+                .lock()
+                .unwrap()
+                .push((url.to_string(), names, body.to_vec()));
+            Ok(self.restore_status)
+        }
+
+        fn head(&self, _url: &str, _headers: HeaderMap) -> RusticResult<HeadResult> {
+            Ok(self.head.clone())
+        }
+    }
+
+    #[test]
+    fn restore_object_treats_202_as_success_and_signs_request() {
+        let fake = Arc::new(FakeS3 {
+            restore_status: 202,
+            ..FakeS3::default()
+        });
+        let client = S3Restore::with_transport(fake.clone());
+        client.restore_key("data/ab/abcd").unwrap();
+        let calls = fake.restore_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (url, headers, body) = &calls[0];
+        assert!(url.contains("restore"), "url={url}");
+        assert!(
+            headers.iter().any(|h| h == "authorization"),
+            "headers={headers:?}"
+        );
+        let body = String::from_utf8_lossy(body);
+        assert!(body.contains("<Days>7</Days>"), "body={body}");
+        assert!(body.contains("<Tier>Standard</Tier>"), "body={body}");
+    }
+
+    #[test]
+    fn restore_object_treats_409_as_already_in_progress() {
+        let fake = Arc::new(FakeS3 {
+            restore_status: 409,
+            ..FakeS3::default()
+        });
+        S3Restore::with_transport(fake)
+            .restore_key("data/ab/abcd")
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_object_fails_on_http_400() {
+        let fake = Arc::new(FakeS3 {
+            restore_status: 400,
+            ..FakeS3::default()
+        });
+        let err = S3Restore::with_transport(fake)
+            .restore_key("data/ab/abcd")
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("400"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn status_key_uses_head_object_headers() {
+        let fake = Arc::new(FakeS3 {
+            head: HeadResult {
+                status: 200,
+                storage_class: Some("GLACIER".into()),
+                restore: Some("ongoing-request=\"true\"".into()),
+            },
+            ..FakeS3::default()
+        });
+        let status = S3Restore::with_transport(fake)
+            .status_key("data/ab/abcd")
+            .unwrap();
+        assert_eq!(status, WarmupStatus::Warming);
+    }
+
+    #[test]
+    fn from_options_disabled_without_enable_restore() {
+        let opts = BTreeMap::from([("bucket".into(), "b".into())]);
+        let glacier = GlacierConfig::default();
+        assert!(S3Restore::from_options(&opts, &glacier).unwrap().is_none());
+    }
+
+    #[test]
+    fn from_options_requires_credentials_when_enabled() {
+        if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
+            return;
+        }
+        let opts = BTreeMap::from([("bucket".into(), "b".into())]);
+        let glacier = GlacierConfig {
+            enable_restore: true,
+            ..GlacierConfig::default()
+        };
+        let err = S3Restore::from_options(&opts, &glacier).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("access_key") || msg.contains("credential"),
+            "unexpected error: {msg}"
+        );
     }
 }
