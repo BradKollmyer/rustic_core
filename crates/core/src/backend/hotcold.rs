@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    backend::{BytesList, FileType, ReadBackend, WriteBackend},
+    backend::{BytesList, FileType, ReadBackend, WarmupStatus, WriteBackend},
     error::RusticResult,
     id::Id,
 };
@@ -78,6 +78,18 @@ impl ReadBackend for HotColdBackend {
 
     fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
         self.be.warmup_path(tpe, id)
+    }
+
+    fn reports_warmup_status(&self) -> bool {
+        self.be.reports_warmup_status()
+    }
+
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        self.be.warmup_status(tpe, id)
+    }
+
+    fn archive_class(&self) -> Option<&str> {
+        self.be.archive_class()
     }
 }
 

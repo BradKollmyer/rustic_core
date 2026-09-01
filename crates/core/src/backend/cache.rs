@@ -13,7 +13,7 @@ use log::{trace, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    backend::{BytesList, FileType, ReadBackend, WriteBackend},
+    backend::{BytesList, FileType, ReadBackend, WarmupStatus, WriteBackend},
     error::{ErrorKind, RusticError, RusticResult},
     id::Id,
     repofile::configfile::RepositoryId,
@@ -202,6 +202,18 @@ impl ReadBackend for CachedBackend {
     fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
         // Delegate to the underlying backend
         self.be.warmup_path(tpe, id)
+    }
+
+    fn reports_warmup_status(&self) -> bool {
+        self.be.reports_warmup_status()
+    }
+
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        self.be.warmup_status(tpe, id)
+    }
+
+    fn archive_class(&self) -> Option<&str> {
+        self.be.archive_class()
     }
 }
 

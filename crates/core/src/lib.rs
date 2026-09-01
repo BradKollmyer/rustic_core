@@ -131,7 +131,7 @@ pub use jiff;
 pub use crate::{
     backend::{
         ALL_FILE_TYPES, BytesList, FileType, ReadBackend, ReadSource, ReadSourceEntry,
-        ReadSourceOpen, RepositoryBackends, WriteBackend,
+        ReadSourceOpen, RepositoryBackends, WarmupStatus, WriteBackend,
         childstdout::ChildStdoutSource,
         decrypt::{compression_level_range, max_compression_level},
         ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},

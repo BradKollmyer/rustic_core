@@ -3,7 +3,7 @@ use zstd::decode_all;
 
 use crate::{
     backend::{
-        BytesList, FileType, ReadBackend, WriteBackend,
+        BytesList, FileType, ReadBackend, WarmupStatus, WriteBackend,
         decrypt::{DecryptFullBackend, DecryptReadBackend, DecryptWriteBackend},
     },
     error::{ErrorKind, RusticError, RusticResult},
@@ -112,6 +112,22 @@ impl<BE: DecryptFullBackend> ReadBackend for DryRunBackend<BE> {
     fn needs_warm_up(&self) -> bool {
         // Delegate to the underlying backend
         self.be.needs_warm_up()
+    }
+
+    fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
+        self.be.warm_up(tpe, id)
+    }
+
+    fn reports_warmup_status(&self) -> bool {
+        self.be.reports_warmup_status()
+    }
+
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        self.be.warmup_status(tpe, id)
+    }
+
+    fn archive_class(&self) -> Option<&str> {
+        self.be.archive_class()
     }
 }
 

@@ -650,6 +650,60 @@ impl<S> Repository<S> {
         warm_up_wait(self, I::TYPE, ids.map(|id| *id))
     }
 
+    /// Return warmup status for each id.
+    ///
+    /// # Errors
+    ///
+    /// * If the backend cannot determine status.
+    pub fn warmup_status<I: RepoId>(
+        &self,
+        ids: impl ExactSizeIterator<Item = I>,
+    ) -> RusticResult<Vec<(I, crate::WarmupStatus)>> {
+        ids.map(|id| {
+            let status = self.be.warmup_status(I::TYPE, &*id)?;
+            Ok((id, status))
+        })
+        .collect()
+    }
+
+    /// Fail if any id is cold or still warming.
+    ///
+    /// Backends that do not report real status (trait default) error so callers
+    /// cannot mistake "always warm" for a successful check.
+    ///
+    /// # Errors
+    ///
+    /// * If the backend cannot check status.
+    /// * If any id is [`crate::WarmupStatus::Cold`] or [`crate::WarmupStatus::Warming`].
+    pub fn require_warm<I: RepoId>(
+        &self,
+        ids: impl ExactSizeIterator<Item = I>,
+    ) -> RusticResult<()> {
+        if !self.be.reports_warmup_status() {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "This backend cannot check warmup status. Set `enable_restore` for S3 Glacier or omit `--require-warm`.",
+            ));
+        }
+        if ids.len() == 0 {
+            return Ok(());
+        }
+        for id in ids {
+            match self.be.warmup_status(I::TYPE, &*id)? {
+                crate::WarmupStatus::Warm | crate::WarmupStatus::Lukewarm => {}
+                status => {
+                    return Err(RusticError::new(
+                        ErrorKind::Backend,
+                        "Pack `{id}` is not warm (status: {status}). Run `rustic warmup` / `warmup --wait` first.",
+                    )
+                    .attach_context("id", (*id).to_string())
+                    .attach_context("status", format!("{status:?}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Repair hotcold files except packs
     ///
     /// This compares the files in the hot and cold repo part and copies missing ones.

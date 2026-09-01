@@ -195,6 +195,39 @@ pub trait ReadBackend: Send + Sync + 'static {
     fn warm_up(&self, _tpe: FileType, _id: &Id) -> RusticResult<()> {
         Ok(())
     }
+
+    /// Whether [`Self::warmup_status`] reports real cold/warming/warm state.
+    ///
+    /// The trait default is always [`WarmupStatus::Warm`]. Callers such as
+    /// `--require-warm` must not treat that default as a successful status check.
+    fn reports_warmup_status(&self) -> bool {
+        false
+    }
+
+    /// Return the warmup status of the given file.
+    ///
+    /// The default is [`WarmupStatus::Warm`] (backend does not track cold storage).
+    fn warmup_status(&self, _tpe: FileType, _id: &Id) -> RusticResult<WarmupStatus> {
+        Ok(WarmupStatus::Warm)
+    }
+
+    /// Configured archive storage class for data packs, e.g. `Some("DEEP_ARCHIVE")`.
+    fn archive_class(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Status of a file with respect to cold storage restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmupStatus {
+    /// Object is in an archive class and has no readable temporary copy.
+    Cold,
+    /// RestoreObject has been requested and is still in progress.
+    Warming,
+    /// Object is readable (standard class, instant retrieval, or restored copy).
+    Warm,
+    /// Restored copy expires within 24 hours; a refresh RestoreObject is advised.
+    Lukewarm,
 }
 
 /// Trait for Searching in a backend.
@@ -474,6 +507,15 @@ impl ReadBackend for Arc<dyn WriteBackend> {
     }
     fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
         self.deref().warm_up(tpe, id)
+    }
+    fn reports_warmup_status(&self) -> bool {
+        self.deref().reports_warmup_status()
+    }
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        self.deref().warmup_status(tpe, id)
+    }
+    fn archive_class(&self) -> Option<&str> {
+        self.deref().archive_class()
     }
 }
 

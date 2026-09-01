@@ -114,9 +114,17 @@ pub struct PruneOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub repack_all: bool,
 
-    /// Only repack packs which are cacheable [default: true for a hot/cold repository, else false]
+    /// Only repack packs which are cacheable [default: true for a hot/cold repository or archive class, else false]
     #[cfg_attr(feature = "clap", clap(long, value_name = "TRUE/FALSE"))]
     pub repack_cacheable_only: Option<bool>,
+
+    /// Allow rewriting mixed data packs (disables the Glacier/hot-cold default)
+    #[cfg_attr(feature = "clap", clap(long, conflicts_with = "repack_cacheable_only"))]
+    pub repack_data: bool,
+
+    /// Fail if packs to repack are still cold; do not request RestoreObject
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub require_warm: bool,
 
     /// Do not repack packs which only needs to be resized
     #[cfg_attr(feature = "clap", clap(long))]
@@ -146,6 +154,8 @@ impl Default for PruneOptions {
             repack_uncompressed: false,
             repack_all: false,
             repack_cacheable_only: None,
+            repack_data: false,
+            require_warm: false,
             no_resize: false,
             ignore_snaps: Vec::new(),
         }
@@ -737,9 +747,18 @@ impl PrunePlan {
         let mut pruner = Self::new(used_ids, existing_packs, index_files);
         pruner.count_used_blobs();
         pruner.check()?;
-        let repack_cacheable_only = opts
-            .repack_cacheable_only
-            .unwrap_or_else(|| repo.config().is_hot == Some(true));
+        let repack_cacheable_only = if opts.repack_data {
+            false
+        } else {
+            opts.repack_cacheable_only.unwrap_or_else(|| {
+                repo.config().is_hot == Some(true) || repo.be.archive_class().is_some()
+            })
+        };
+        if repo.be.archive_class().is_some() {
+            log::warn!(
+                "archive storage class is set: mixed data packs are not rewritten by default; deleting unused packs younger than 90/180 days still incurs AWS early-delete fees (use --keep-pack)"
+            );
+        }
         let pack_sizer =
             total_size.map(|tpe, size| PackSizer::from_config(repo.config(), tpe, size));
 
@@ -1223,7 +1242,11 @@ pub(crate) fn prune_repository<S: Open>(
             "Pruning is not allowed in append-only repositories. Please disable append-only mode first, if you know what you are doing. Aborting.",
         ));
     }
-    repo.warm_up_wait(prune_plan.repack_packs().into_iter())?;
+    if opts.require_warm {
+        repo.require_warm(prune_plan.repack_packs().into_iter())?;
+    } else {
+        repo.warm_up_wait(prune_plan.repack_packs().into_iter())?;
+    }
     let be = repo.dbe();
     let prune_time = prune_plan.time.timestamp();
 

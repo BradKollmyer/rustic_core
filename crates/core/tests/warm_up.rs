@@ -889,3 +889,52 @@ echo '{"type":"pack-progress","warm":999}'
 
     Ok(())
 }
+
+#[test]
+fn test_require_warm_errors_when_backend_cannot_report() -> Result<()> {
+    let be = InMemoryBackend::new();
+    let repo = rustic_core::Repository::new(
+        &RepositoryOptions::default(),
+        &RepositoryBackends::new(Arc::new(be), None),
+    )?;
+    let err = repo
+        .require_warm(create_test_ids(1).into_iter())
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.to_lowercase().contains("warmup status"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_require_warm_fails_on_cold_packs() -> Result<()> {
+    let be = InMemoryBackend::new_cold();
+    let repo = rustic_core::Repository::new(
+        &RepositoryOptions::default(),
+        &RepositoryBackends::new(Arc::new(be), None),
+    )?;
+    let err = repo
+        .require_warm(create_test_ids(1).into_iter())
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not warm") || msg.contains("Cold"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_cold_backend_warm_up_marks_packs_warm() -> Result<()> {
+    let be = InMemoryBackend::new_cold();
+    let repo = rustic_core::Repository::new(
+        &RepositoryOptions::default(),
+        &RepositoryBackends::new(Arc::new(be), None),
+    )?;
+    let ids = create_test_ids(2);
+    repo.warm_up_wait(ids.iter().copied())?;
+    repo.require_warm(ids.into_iter())?;
+    Ok(())
+}

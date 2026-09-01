@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
 
 use backon::{BlockingRetryable, ExponentialBuilder};
 
@@ -11,7 +12,7 @@ use serde::Deserialize;
 
 use crate::{
     CommandInput, Id, Progress,
-    backend::{FileType, ReadBackend},
+    backend::{FileType, ReadBackend, WarmupStatus},
     error::{ErrorKind, RusticError, RusticResult},
     repository::Repository,
 };
@@ -21,6 +22,12 @@ pub(super) mod constants {
 
     /// The maximum number of reader threads to use for warm-up.
     pub(super) const MAX_READER_THREADS_NUM: usize = 20;
+
+    /// Poll interval while waiting for RestoreObject to finish.
+    pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Default poll timeout when no `--warm-up-wait` is set.
+    pub(super) const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// The maximum number of retries for spawning commands.
     pub(crate) const MAX_RETRIES: usize = 5;
@@ -118,31 +125,105 @@ pub(crate) fn warm_up_wait<S>(
     tpe: FileType,
     ids: impl ExactSizeIterator<Item = Id> + Clone,
 ) -> RusticResult<()> {
-    if ids.len() > 0 {
-        warm_up(repo, tpe, ids.clone())?;
+    if ids.len() == 0 {
+        return Ok(());
+    }
 
-        if let Some(warm_up_wait_cmd) = &repo.opts.warm_up_wait_command {
-            warm_up_command(
-                tpe,
-                ids,
-                warm_up_wait_cmd,
-                repo,
-                &WarmUpType::Wait,
-                repo.opts.warm_up_batch.unwrap_or(1),
-                &repo.be,
-            )?;
-        } else if let Some(wait) = repo.opts.warm_up_wait {
-            let p = repo.progress_spinner(&format!("waiting {wait}..."));
-            sleep(
-                wait.try_into()
-                    // ignore conversation errors, but print out warning
-                    .inspect_err(|err| warn!("cannot wait for warm-up: {err}"))
-                    .unwrap_or_default(),
-            );
-            p.finish();
+    warm_up(repo, tpe, ids.clone())?;
+
+    if let Some(warm_up_wait_cmd) = &repo.opts.warm_up_wait_command {
+        warm_up_command(
+            tpe,
+            ids,
+            warm_up_wait_cmd,
+            repo,
+            &WarmUpType::Wait,
+            repo.opts.warm_up_batch.unwrap_or(1),
+            &repo.be,
+        )?;
+        return Ok(());
+    }
+
+    let ids: Vec<Id> = ids.collect();
+    let mut needs_poll = false;
+    for id in &ids {
+        match repo.be.warmup_status(tpe, id)? {
+            WarmupStatus::Warm => {}
+            WarmupStatus::Cold | WarmupStatus::Warming | WarmupStatus::Lukewarm => {
+                needs_poll = true;
+            }
         }
     }
+
+    if needs_poll {
+        poll_until_warm(repo, tpe, &ids)?;
+    } else if let Some(wait) = repo.opts.warm_up_wait {
+        let p = repo.progress_spinner(&format!("waiting {wait}..."));
+        sleep(
+            wait.try_into()
+                // ignore conversation errors, but print out warning
+                .inspect_err(|err| warn!("cannot wait for warm-up: {err}"))
+                .unwrap_or_default(),
+        );
+        p.finish();
+    }
     Ok(())
+}
+
+fn poll_until_warm<S>(repo: &Repository<S>, tpe: FileType, ids: &[Id]) -> RusticResult<()> {
+    let timeout: Duration = repo
+        .opts
+        .warm_up_wait
+        .and_then(|wait| Duration::try_from(wait).ok())
+        .unwrap_or(constants::DEFAULT_POLL_TIMEOUT);
+    let interval = if timeout < constants::POLL_INTERVAL {
+        (timeout / 4).max(Duration::from_millis(10))
+    } else {
+        constants::POLL_INTERVAL
+    };
+
+    let start = Instant::now();
+    loop {
+        let mut warm = 0u64;
+        let mut warming = 0u64;
+        let mut cold = 0u64;
+        for id in ids {
+            match repo.be.warmup_status(tpe, id)? {
+                WarmupStatus::Warm => warm += 1,
+                WarmupStatus::Warming => warming += 1,
+                WarmupStatus::Cold => {
+                    cold += 1;
+                    repo.be.warm_up(tpe, id)?;
+                }
+                WarmupStatus::Lukewarm => {
+                    warming += 1;
+                    repo.be.warm_up(tpe, id)?;
+                }
+            }
+        }
+
+        info!(
+            "waiting for cold packs: {warm} warm, {warming} warming, {cold} cold, next poll {}s",
+            interval.as_secs().max(1)
+        );
+
+        if cold == 0 && warming == 0 {
+            return Ok(());
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "Timed out waiting for {remaining} cold/warming pack(s) after {timeout}. Increase `--warm-up-wait` or `restore_timeout`.",
+            )
+            .attach_context("remaining", (cold + warming).to_string())
+            .attach_context("timeout", format!("{timeout:?}")));
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        sleep(interval.min(remaining));
+    }
 }
 
 /// Warm up the repository.

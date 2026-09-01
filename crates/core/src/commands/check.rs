@@ -200,6 +200,10 @@ pub struct CheckOptions {
         clap(long, default_value = "all", requires = "read_data")
     )]
     pub read_data_subset: ReadSubsetOption,
+
+    /// Fail if needed data packs are still cold; do not request RestoreObject
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub require_warm: bool,
 }
 
 /// Runs the `check` command
@@ -295,7 +299,11 @@ pub(crate) fn check_repository<S: Open>(
         debug!("using read-data-subset {:?}", opts.read_data_subset);
         let packs = opts.read_data_subset.apply(packs);
 
-        repo.warm_up_wait(packs.iter().map(|pack| pack.id))?;
+        if opts.require_warm {
+            repo.require_warm(packs.iter().map(|pack| pack.id))?;
+        } else {
+            repo.warm_up_wait(packs.iter().map(|pack| pack.id))?;
+        }
 
         let total_pack_size = packs.iter().map(|pack| u64::from(pack.pack_size())).sum();
         let p = repo.progress_bytes("reading pack data...");

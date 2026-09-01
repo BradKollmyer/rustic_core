@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    backend::{BytesList, FileType, ReadBackend, WriteBackend},
+    backend::{BytesList, FileType, ReadBackend, WarmupStatus, WriteBackend},
     error::RusticResult,
     id::Id,
 };
@@ -63,6 +63,19 @@ impl ReadBackend for WarmUpAccessBackend {
     fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
         // Delegate to the underlying backend
         self.be.warmup_path(tpe, id)
+    }
+
+    // Keep the trait default Warm so duration-wait (OVH) is not replaced by a poll.
+    fn reports_warmup_status(&self) -> bool {
+        false
+    }
+
+    fn warmup_status(&self, _tpe: FileType, _id: &Id) -> RusticResult<WarmupStatus> {
+        Ok(WarmupStatus::Warm)
+    }
+
+    fn archive_class(&self) -> Option<&str> {
+        self.be.archive_class()
     }
 }
 

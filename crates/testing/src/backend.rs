@@ -9,7 +9,8 @@ pub mod in_memory_backend {
     use enum_map::EnumMap;
 
     use rustic_core::{
-        BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
+        BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WarmupStatus,
+        WriteBackend,
     };
 
     #[derive(Debug)]
@@ -141,6 +142,18 @@ pub mod in_memory_backend {
                 _ = self.warm.write().unwrap()[tpe].insert(*id);
             }
             Ok(())
+        }
+
+        fn reports_warmup_status(&self) -> bool {
+            self.is_cold
+        }
+
+        fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+            if self.is_cold && !self.warm.read().unwrap()[tpe].contains(id) {
+                Ok(WarmupStatus::Cold)
+            } else {
+                Ok(WarmupStatus::Warm)
+            }
         }
     }
 

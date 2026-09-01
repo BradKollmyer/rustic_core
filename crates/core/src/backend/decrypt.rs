@@ -9,7 +9,7 @@ pub use zstd::compression_level_range;
 
 use crate::{
     BytesList, Progress,
-    backend::{FileType, ReadBackend, WriteBackend},
+    backend::{FileType, ReadBackend, WarmupStatus, WriteBackend},
     blob::BlobLocation,
     crypto::{CryptoKey, hasher::hash},
     error::{ErrorKind, RusticError, RusticResult},
@@ -666,6 +666,22 @@ impl<C: CryptoKey> ReadBackend for DecryptBackend<C> {
     fn needs_warm_up(&self) -> bool {
         // Delegate to the underlying backend
         self.be.needs_warm_up()
+    }
+
+    fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
+        self.be.warm_up(tpe, id)
+    }
+
+    fn reports_warmup_status(&self) -> bool {
+        self.be.reports_warmup_status()
+    }
+
+    fn warmup_status(&self, tpe: FileType, id: &Id) -> RusticResult<WarmupStatus> {
+        self.be.warmup_status(tpe, id)
+    }
+
+    fn archive_class(&self) -> Option<&str> {
+        self.be.archive_class()
     }
 }
 

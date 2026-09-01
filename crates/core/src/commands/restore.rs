@@ -63,6 +63,10 @@ pub struct RestoreOptions {
     /// Restore sparse files
     #[cfg_attr(feature = "clap", clap(long))]
     pub sparse: Option<SparseRestore>,
+
+    /// Fail if any needed data pack is still cold; do not request RestoreObject
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub require_warm: bool,
 }
 
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +134,12 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     dest: &LocalDestination,
 ) -> RusticResult<()> {
-    repo.warm_up_wait(file_infos.to_packs().into_iter())?;
+    let packs = file_infos.to_packs();
+    if opts.require_warm {
+        repo.require_warm(packs.into_iter())?;
+    } else {
+        repo.warm_up_wait(packs.into_iter())?;
+    }
     restore_contents(
         repo,
         dest,
