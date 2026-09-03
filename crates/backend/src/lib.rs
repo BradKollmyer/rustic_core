@@ -19,6 +19,7 @@ The following backends are currently supported and can be enabled with features:
 - `OpenDALBackend` - Backend for accessing a `OpenDAL` filesystem.
 - `RcloneBackend` - Backend for accessing a Rclone filesystem.
 - `RestBackend` - Backend for accessing a REST API.
+- `StorjBackend` - Backend for accessing Storj via native Uplink.
 
 ## Usage & Examples
 
@@ -64,9 +65,16 @@ pub mod util;
 #[cfg(feature = "reqwest")]
 pub(crate) mod reqwest;
 
+#[cfg(any(feature = "rest", feature = "opendal", feature = "storj"))]
+pub(crate) mod runtime;
+
 /// `OpenDAL` backend for Rustic.
 #[cfg(feature = "opendal")]
 pub mod opendal;
+
+/// Native Storj Uplink backend for Rustic.
+#[cfg(feature = "storj")]
+pub mod storj;
 
 /// `Rclone` backend for Rustic.
 #[cfg(feature = "rclone")]
@@ -84,6 +92,9 @@ pub use crate::rclone::RcloneBackend;
 
 #[cfg(feature = "rest")]
 pub use crate::rest::RestBackend;
+
+#[cfg(feature = "storj")]
+pub use crate::storj::StorjBackend;
 
 // rustic_backend Public API
 pub use crate::{

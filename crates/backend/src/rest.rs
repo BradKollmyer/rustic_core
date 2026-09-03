@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use backon::{BlockingRetryable, ExponentialBuilder};
@@ -12,13 +11,13 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
-use tokio::runtime::Runtime;
 
 use rustic_core::{
     BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
 };
 
 use crate::reqwest::reqwest_client;
+use crate::runtime::runtime;
 
 /// joining URL failed on: `{0}`
 #[derive(thiserror::Error, Clone, Copy, Debug, displaydoc::Display)]
@@ -46,16 +45,6 @@ pub struct RestBackend {
     client: Client,
     /// The ``BackoffBuilder`` we use
     backoff: ExponentialBuilder,
-}
-
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    })
 }
 
 impl RestBackend {

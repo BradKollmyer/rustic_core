@@ -19,6 +19,9 @@ use crate::rclone::RcloneBackend;
 #[cfg(feature = "rest")]
 use crate::rest::RestBackend;
 
+#[cfg(feature = "storj")]
+use crate::storj::StorjBackend;
+
 #[cfg(feature = "clap")]
 use clap::ValueHint;
 
@@ -148,7 +151,7 @@ pub trait BackendChoice {
 
 /// The supported backend types.
 ///
-/// Currently supported types are "local", "rclone", "rest", "opendal"
+/// Currently supported types are "local", "rclone", "rest", "opendal", "storj"
 ///
 /// # Notes
 ///
@@ -174,6 +177,11 @@ pub enum SupportedBackend {
     /// An openDAL backend (general)
     #[strum(serialize = "opendal", to_string = "openDAL Backend")]
     OpenDAL,
+
+    #[cfg(feature = "storj")]
+    /// A native Storj Uplink backend
+    #[strum(serialize = "storj", to_string = "Storj Backend")]
+    Storj,
 }
 
 impl BackendChoice for SupportedBackend {
@@ -192,6 +200,8 @@ impl BackendChoice for SupportedBackend {
             Self::Rest => Arc::new(RestBackend::new(location, options)?),
             #[cfg(feature = "opendal")]
             Self::OpenDAL => Arc::new(OpenDALBackend::new(location, options)?),
+            #[cfg(feature = "storj")]
+            Self::Storj => Arc::new(StorjBackend::new(location, options)?),
         })
     }
 }
@@ -211,6 +221,8 @@ mod tests {
     #[case("rest", SupportedBackend::Rest)]
     #[cfg(feature = "opendal")]
     #[case("opendal", SupportedBackend::OpenDAL)]
+    #[cfg(feature = "storj")]
+    #[case("storj", SupportedBackend::Storj)]
     fn test_try_from_is_ok(#[case] input: &str, #[case] expected: SupportedBackend) {
         assert_eq!(SupportedBackend::try_from(input).unwrap(), expected);
     }

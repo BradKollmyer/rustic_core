@@ -89,6 +89,11 @@ This crate exposes a few features for controlling dependency usage:
 - **rest** - Enables support for the `rest` backend. *This feature is enabled by
   default*.
 
+- **storj** - Enables support for the native Storj Uplink backend (`storj:` URLs).
+  *This feature is enabled by default*. On aarch64, build with
+  `--cfg aes_armv8 --cfg polyval_armv8` so AES-GCM uses ARMv8 crypto
+  extensions (see the `storj` crate README).
+
 ## Usage & Examples
 
 Due to being a support crate for

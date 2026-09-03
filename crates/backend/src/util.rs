@@ -26,6 +26,18 @@ impl std::fmt::Display for BackendLocation {
     }
 }
 
+impl From<&str> for BackendLocation {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for BackendLocation {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Splits the given url into the backend type and the path.
 ///
 /// # Arguments
@@ -106,6 +118,12 @@ mod tests {
         "opendal:https://example.com/tmp/repo",
         (SupportedBackend::OpenDAL,
         BackendLocation::try_from("https://example.com/tmp/repo").unwrap())
+    )]
+    #[cfg(feature = "storj")]
+    #[case(
+        "storj:backups/home",
+        (SupportedBackend::Storj,
+        BackendLocation::try_from("backups/home").unwrap())
     )]
     #[cfg(windows)]
     #[case(
@@ -209,5 +227,13 @@ mod tests {
     ) {
         // Check https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
         assert_eq!(location_to_type_and_path(url).unwrap(), expected);
+    }
+
+    #[cfg(feature = "storj")]
+    #[test]
+    fn storj_url_splits_bucket_and_prefix() {
+        let (be, loc) = location_to_type_and_path("storj:backups/home").unwrap();
+        assert_eq!(be, SupportedBackend::Storj);
+        assert_eq!(loc.as_ref(), "backups/home");
     }
 }

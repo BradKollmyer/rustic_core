@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- native Storj Uplink backend (`storj:bucket/prefix`) using the `storj` crate
+
 ## [0.7.0](https://github.com/rustic-rs/rustic_core/compare/rustic_backend-v0.6.2...rustic_backend-v0.7.0) - 2026-08-16
 
 ### Added

@@ -1,11 +1,5 @@
 /// `OpenDAL` backend for rustic.
-use std::{
-    collections::BTreeMap,
-    ffi::OsStr,
-    str::FromStr,
-    sync::{Arc, OnceLock},
-    vec::IntoIter,
-};
+use std::{collections::BTreeMap, ffi::OsStr, str::FromStr, sync::Arc, vec::IntoIter};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -20,7 +14,6 @@ use opendal::{
 };
 use opendal_http_transport_reqwest::ReqwestTransport;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use tokio::runtime::Runtime;
 use typed_path::UnixPathBuf;
 
 use rustic_core::{
@@ -30,6 +23,7 @@ use rustic_core::{
 };
 
 use crate::reqwest::reqwest_client;
+use crate::runtime::runtime;
 
 mod constants {
     /// Default number of retries
@@ -48,16 +42,6 @@ mod constants {
 #[derive(Clone, Debug)]
 pub struct OpenDALBackend {
     operator: Operator,
-}
-
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    })
 }
 
 /// Log `OpenDAL` retries as a single line using `Display`, not `Debug`.

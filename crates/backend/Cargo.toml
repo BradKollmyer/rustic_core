@@ -30,7 +30,7 @@ harness = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["opendal", "rest", "rclone"]
+default = ["opendal", "rest", "rclone", "storj"]
 cli = ["merge", "clap"]
 merge = ["dep:conflate"]
 clap = ["dep:clap"]
@@ -52,6 +52,14 @@ rest = [
   "tokio/rt-multi-thread",
 ]
 rclone = ["rest", "dep:rand", "dep:semver"]
+storj = [
+  "dep:storj",
+  "dep:tokio",
+  "dep:futures-util",
+  "dep:backon",
+  "tokio/rt-multi-thread",
+  "tokio/io-util",
+]
 
 [dependencies]
 # core
@@ -96,6 +104,9 @@ futures-util = { version = "0.3.34", default-features = false, optional = true }
 # rclone backend
 rand = { version = "0.10.0", optional = true }
 semver = { version = "1.0.27", optional = true }
+
+# storj backend
+storj = { version = "1.0", optional = true }
 
 # opendal backend
 bytesize = "2.3.1"
