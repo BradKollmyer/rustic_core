@@ -1,6 +1,9 @@
 //! Opt-in prune upload pool. Pack bodies share one rendezvous queue and I/O budget.
 
-use super::packer::FileWriterHandle;
+use super::{
+    byte_budget::{BytePermit, RepackBuffers},
+    packer::FileWriterHandle,
+};
 use crate::{
     backend::{BytesList, decrypt::DecryptWriteBackend},
     crypto::hasher::hash_reader,
@@ -43,27 +46,33 @@ impl Drop for IoPermit<'_> {
     }
 }
 
-type Job = (BytesList, IndexPack, bool);
+type Job = (BytesList, IndexPack, bool, BytePermit);
 #[derive(Clone)]
 pub(crate) struct UploadSender {
     tx: Sender<Job>,
     stopped: Arc<AtomicBool>,
+    buffers: RepackBuffers,
 }
 impl UploadSender {
-    pub(crate) fn send(
-        &self,
-        file: BytesList,
-        index: IndexPack,
-        cacheable: bool,
-    ) -> RusticResult<()> {
+    pub(crate) fn reserve(&self, bytes: u64) -> RusticResult<BytePermit> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(RusticError::new(
                 ErrorKind::Backend,
                 "Pack upload pool stopped after a failure.",
             ));
         }
+        self.buffers.uploads.acquire(bytes)
+    }
+
+    pub(crate) fn send(
+        &self,
+        file: BytesList,
+        index: IndexPack,
+        cacheable: bool,
+        bytes: BytePermit,
+    ) -> RusticResult<()> {
         self.tx
-            .send((file, index, cacheable))
+            .send((file, index, cacheable, bytes))
             .map_err(|_| RusticError::new(ErrorKind::Backend, "Pack upload pool disconnected."))
     }
 }
@@ -73,6 +82,7 @@ pub(crate) struct UploadPool {
     workers: Vec<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<RusticError>>>,
+    buffers: RepackBuffers,
 }
 impl UploadPool {
     pub(crate) fn new<BE: DecryptWriteBackend>(
@@ -80,6 +90,7 @@ impl UploadPool {
         indexer: &SharedIndexer<BE>,
         n: usize,
         budget: &IoBudget,
+        buffers: &RepackBuffers,
     ) -> Self {
         let (tx, rx) = bounded::<Job>(0);
         let stopped = Arc::new(AtomicBool::new(false));
@@ -94,14 +105,15 @@ impl UploadPool {
                 be.clone(),
                 indexer.clone(),
             );
+            let buffers = buffers.clone();
             workers.push(std::thread::spawn(move || {
                 while !stopped.load(Ordering::Acquire) {
-                    let (file, index, cacheable) = match rx.recv_timeout(Duration::from_millis(50))
-                    {
-                        Ok(job) => job,
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    };
+                    let (file, index, cacheable, _bytes) =
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(job) => job,
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        };
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -126,6 +138,7 @@ impl UploadPool {
                             .unwrap()
                             .push(*error.attach_context("pack_id", id.to_string()));
                         stopped.store(true, Ordering::Release);
+                        buffers.cancel();
                     }
                 }
             }));
@@ -134,10 +147,12 @@ impl UploadPool {
             sender: Some(UploadSender {
                 tx,
                 stopped: stopped.clone(),
+                buffers: buffers.clone(),
             }),
             workers,
             stopped,
             errors,
+            buffers: buffers.clone(),
         }
     }
     pub(crate) fn sender(&self) -> UploadSender {
@@ -156,6 +171,11 @@ impl UploadPool {
     }
     pub(crate) fn finalize(mut self) -> RusticResult<()> {
         self.join();
+        log::debug!(
+            "repack buffer peaks: reads {} bytes, uploads {} bytes",
+            self.buffers.reads.peak(),
+            self.buffers.uploads.peak()
+        );
         let mut errors = self.errors.lock().unwrap();
         if errors.is_empty() {
             return Ok(());
@@ -175,6 +195,7 @@ impl UploadPool {
 impl Drop for UploadPool {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        self.buffers.cancel();
         self.join();
     }
 }

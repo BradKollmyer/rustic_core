@@ -1,3 +1,4 @@
+use super::byte_budget::ByteBudget;
 use super::upload_pool::{IoBudget, UploadSender};
 use std::{
     num::NonZeroU32,
@@ -536,9 +537,21 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
         self.basic.write_header(data)?;
 
         // write file to backend
+        // Wait while the pack is still owned by its builder. Once detached,
+        // every pack carries a byte permit through hashing, upload and indexing.
+        let bytes = self
+            .shared_uploads
+            .as_ref()
+            .map(|uploads| uploads.reserve(u64::from(self.basic.size)))
+            .transpose()?;
         let (file, index) = self.basic.take_data();
         if let Some(uploads) = &self.shared_uploads {
-            return uploads.send(file, index, self.basic.blob_type.is_cacheable());
+            return uploads.send(
+                file,
+                index,
+                self.basic.blob_type.is_cacheable(),
+                bytes.unwrap(),
+            );
         }
         self.file_writer
             .as_ref()
@@ -950,7 +963,7 @@ where
     packer: Packer<BE>,
     /// the blob type
     blob_type: BlobType,
-    budget: Option<IoBudget>,
+    budget: Option<(IoBudget, ByteBudget)>,
 }
 
 impl<BE: DecryptFullBackend> BlobCopier<BE> {
@@ -988,7 +1001,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
         indexer: SharedIndexer<BE>,
         pack_sizer: PackSizer,
         uploads: Option<UploadSender>,
-        budget: Option<IoBudget>,
+        budget: Option<(IoBudget, ByteBudget)>,
     ) -> RusticResult<Self> {
         let packer = Packer::new_with_uploads(be_dst, blob_type, indexer, pack_sizer, uploads)?;
         Ok(Self {
@@ -1012,7 +1025,12 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
     /// * If reading the blob from the backend fails
     pub fn copy_fast(&self, pack_blobs: CopyPackBlobs, p: &Progress) -> RusticResult<()> {
         let offset = pack_blobs.locations.offset;
-        let permit = self.budget.as_ref().map(IoBudget::acquire);
+        let _bytes = self
+            .budget
+            .as_ref()
+            .map(|(_, bytes)| bytes.acquire(u64::from(pack_blobs.locations.length)))
+            .transpose()?;
+        let permit = self.budget.as_ref().map(|(io, _)| io.acquire());
         let data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,
@@ -1061,7 +1079,12 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
     /// * If reading the blob from the backend fails
     pub fn copy(&self, pack_blobs: CopyPackBlobs, p: &Progress) -> RusticResult<()> {
         let offset = pack_blobs.locations.offset;
-        let permit = self.budget.as_ref().map(IoBudget::acquire);
+        let _bytes = self
+            .budget
+            .as_ref()
+            .map(|(_, bytes)| bytes.acquire(u64::from(pack_blobs.locations.length)))
+            .transpose()?;
+        let permit = self.budget.as_ref().map(|(io, _)| io.acquire());
         let read_data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,

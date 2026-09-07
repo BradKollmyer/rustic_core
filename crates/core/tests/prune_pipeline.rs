@@ -39,6 +39,10 @@ struct Metrics {
     deletes: AtomicUsize,
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
+    live_read_bytes: AtomicU64,
+    peak_read_bytes: AtomicU64,
+    live_write_bytes: AtomicU64,
+    peak_write_bytes: AtomicU64,
     read_ms: AtomicU64,
     write_ms: AtomicU64,
     failures: AtomicUsize,
@@ -48,6 +52,46 @@ struct Metrics {
     completed: Mutex<BTreeSet<Id>>,
     published: Mutex<Vec<(Id, BTreeSet<Id>)>>,
 }
+struct HeldBytes {
+    metrics: Arc<Metrics>,
+    bytes: u64,
+    upload: bool,
+}
+impl HeldBytes {
+    fn new(metrics: &Arc<Metrics>, bytes: u64, upload: bool) -> Self {
+        let (live, peak) = if upload {
+            (&metrics.live_write_bytes, &metrics.peak_write_bytes)
+        } else {
+            (&metrics.live_read_bytes, &metrics.peak_read_bytes)
+        };
+        peak.fetch_max(live.fetch_add(bytes, SeqCst) + bytes, SeqCst);
+        Self {
+            metrics: metrics.clone(),
+            bytes,
+            upload,
+        }
+    }
+}
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        let live = if self.upload {
+            &self.metrics.live_write_bytes
+        } else {
+            &self.metrics.live_read_bytes
+        };
+        live.fetch_sub(self.bytes, SeqCst);
+    }
+}
+struct TrackedRead {
+    data: Bytes,
+    _hold: HeldBytes,
+}
+impl AsRef<[u8]> for TrackedRead {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 struct Active<'a> {
     metrics: &'a Metrics,
     upload: bool,
@@ -121,7 +165,9 @@ impl ReadBackend for DelayedBackend {
         }
         self.metrics.read_bytes.fetch_add(u64::from(l), SeqCst);
         thread::sleep(Duration::from_millis(self.metrics.read_ms.load(SeqCst)));
-        self.inner.read_partial(t, id, c, o, l)
+        let hold = HeldBytes::new(&self.metrics, u64::from(l), false);
+        let data = self.inner.read_partial(t, id, c, o, l)?;
+        Ok(Bytes::from_owner(TrackedRead { data, _hold: hold }))
     }
 }
 impl WriteBackend for DelayedBackend {
@@ -141,6 +187,7 @@ impl WriteBackend for DelayedBackend {
         }
         if t == FileType::Pack {
             let _active = self.metrics.enter(true);
+            let _hold = HeldBytes::new(&self.metrics, data.size() as u64, true);
             self.metrics.puts.fetch_add(1, SeqCst);
             self.metrics.write_bytes.fetch_add(
                 data.slice().iter().map(|b| b.len() as u64).sum::<u64>(),
@@ -319,6 +366,71 @@ fn backend_limits_reach_prune_through_cache_and_cap_overrides() -> Result<()> {
     assert!(repo.prune(&opts, plan).is_err());
     assert_eq!(backend.metrics.puts.load(SeqCst), 0);
     assert_eq!(backend.metrics.deletes.load(SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn byte_limits_bound_live_buffers_and_split_large_ranges() -> Result<()> {
+    let seed = seed(32)?;
+    for fast in [false, true] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let m = &backend.metrics;
+        let opts = opts(Some(10), fast)
+            .repack_read_buffer(ByteSize::kib(256))
+            .repack_upload_buffer(ByteSize::mib(2));
+        let plan = repo.prune_plan(&opts)?;
+        m.write_ms.store(10, SeqCst);
+        m.enabled.store(true, SeqCst);
+        repo.prune(&opts, plan)?;
+        assert!(m.peak_read_bytes.load(SeqCst) <= opts.repack_read_buffer.as_u64());
+        assert!(m.peak_write_bytes.load(SeqCst) <= opts.repack_upload_buffer.as_u64());
+        assert!(
+            m.gets.load(SeqCst) > 32,
+            "ranges should split to fit the byte budget"
+        );
+        assert_eq!(m.live_read_bytes.load(SeqCst), 0);
+        assert_eq!(m.live_write_bytes.load(SeqCst), 0);
+        published_after_upload(&repo, m)?;
+        m.enabled.store(false, SeqCst);
+        repo.check(CheckOptions::default().read_data(true))?
+            .is_ok()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn oversized_buffers_fail_with_sizing_context_without_deleting_old_data() -> Result<()> {
+    let seed = seed(8)?;
+    for (read, upload, option) in [
+        (1, 2_097_152, "--repack-read-buffer"),
+        (262_144, 1, "--repack-upload-buffer"),
+    ] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let opts = opts(Some(5), true)
+            .repack_read_buffer(ByteSize::b(read))
+            .repack_upload_buffer(ByteSize::b(upload));
+        let plan = repo.prune_plan(&opts)?;
+        backend.metrics.enabled.store(true, SeqCst);
+        let error = repo.prune(&opts, plan).unwrap_err();
+        assert_eq!(error.context_value("option"), Some(option), "{error}");
+        assert!(error.context_value("required_bytes").is_some());
+        assert_eq!(backend.metrics.deletes.load(SeqCst), 0);
+        assert_eq!(backend.metrics.active.load(SeqCst), 0);
+        backend.metrics.enabled.store(false, SeqCst);
+        repo.check(CheckOptions::default().read_data(true))?
+            .is_ok()?;
+    }
+    for (read, upload) in [(0, 1), (1, 0)] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let opts = opts(Some(5), true)
+            .repack_read_buffer(ByteSize::b(read))
+            .repack_upload_buffer(ByteSize::b(upload));
+        let plan = repo.prune_plan(&opts)?;
+        backend.metrics.enabled.store(true, SeqCst);
+        assert!(repo.prune(&opts, plan).is_err());
+        assert_eq!(backend.metrics.puts.load(SeqCst), 0);
+        assert_eq!(backend.metrics.deletes.load(SeqCst), 0);
+    }
     Ok(())
 }
 

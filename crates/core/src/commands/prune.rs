@@ -27,6 +27,7 @@ use crate::{
     },
     blob::{
         BlobId, BlobLocations, BlobType, BlobTypeMap, Initialize,
+        byte_budget::RepackBuffers,
         packer::{BlobCopier, CopyPackBlobs, PackSizer},
         tree::{OnTreeLoad, TreeStreamer, UsedBlobsTree},
         upload_pool::{IoBudget, UploadPool},
@@ -225,6 +226,20 @@ pub struct PruneOptions {
     #[cfg_attr(feature = "clap", clap(long, value_name = "N"))]
     pub repack_connections: Option<usize>,
 
+    /// Maximum buffered range-download bytes for parallel repack. Excludes decoded/compression buffers.
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, value_name = "SIZE", default_value = "128MiB")
+    )]
+    pub repack_read_buffer: ByteSize,
+
+    /// Maximum pack bytes admitted to upload workers. Excludes the two pack builders and backend buffers.
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, value_name = "SIZE", default_value = "256MiB")
+    )]
+    pub repack_upload_buffer: ByteSize,
+
     /// Repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
     /// Implies --max-unused=0.
     #[cfg_attr(feature = "clap", clap(long, conflicts_with = "fast_repack"))]
@@ -284,6 +299,8 @@ impl Default for PruneOptions {
             fast_repack: false,
             repack_connections: None,
             parallel_repack: false,
+            repack_read_buffer: ByteSize::mib(128),
+            repack_upload_buffer: ByteSize::mib(256),
             repack_uncompressed: false,
             repack_all: false,
             repack_cacheable_only: None,
@@ -1368,12 +1385,21 @@ impl PrunePlan {
 /// TODO! In weird circumstances, should be fixed.
 #[allow(clippy::significant_drop_tightening)]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err)] // Coalesce must return both original ranges when they cannot merge.
 pub(crate) fn prune_repository<S: Open>(
     repo: &Repository<S>,
     opts: &PruneOptions,
     prune_plan: PrunePlan,
 ) -> RusticResult<()> {
     let connections = opts.effective_repack_connections(repo.dbe().connection_limit())?;
+    if connections.is_some()
+        && (opts.repack_read_buffer.as_u64() == 0 || opts.repack_upload_buffer.as_u64() == 0)
+    {
+        return Err(RusticError::new(
+            ErrorKind::InvalidInput,
+            "Parallel repack byte budgets must be greater than zero.",
+        ));
+    }
     if repo.config().append_only == Some(true) {
         return Err(RusticError::new(
             ErrorKind::AppendOnly,
@@ -1538,10 +1564,14 @@ pub(crate) fn prune_repository<S: Open>(
             PackSizer::fixed(PackSizer::from_config(repo.config(), blob_type, size).pack_size())
         });
 
+        let buffers = RepackBuffers::new(
+            opts.repack_read_buffer.as_u64(),
+            opts.repack_upload_buffer.as_u64(),
+        );
         let budget = connections.map(IoBudget::new);
         let uploads = budget
             .as_ref()
-            .map(|budget| UploadPool::new(be, &indexer, connections.unwrap(), budget));
+            .map(|budget| UploadPool::new(be, &indexer, connections.unwrap(), budget, &buffers));
         let readers = connections
             .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n - 1).build())
             .transpose()
@@ -1560,7 +1590,7 @@ pub(crate) fn prune_repository<S: Open>(
             indexer.clone(),
             pack_sizer[BlobType::Tree],
             uploads.as_ref().map(UploadPool::sender),
-            budget.clone(),
+            budget.clone().map(|io| (io, buffers.reads.clone())),
         )?;
 
         let data_repacker = BlobCopier::new_with_uploads(
@@ -1570,7 +1600,7 @@ pub(crate) fn prune_repository<S: Open>(
             indexer.clone(),
             pack_sizer[BlobType::Data],
             uploads.as_ref().map(UploadPool::sender),
-            budget,
+            budget.map(|io| (io, buffers.reads.clone())),
         )?;
 
         // write new pack files and index files
@@ -1586,7 +1616,17 @@ pub(crate) fn prune_repository<S: Open>(
                         .blobs
                         .into_iter()
                         .map(|blob| BlobLocations::from_blob_location(blob.location, blob.id))
-                        .coalesce(BlobLocations::coalesce)
+                        .coalesce(|previous, next| {
+                            if connections.is_some()
+                                && (u64::from(next.offset) + u64::from(next.length))
+                                    .saturating_sub(u64::from(previous.offset))
+                                    > buffers.reads.limit()
+                            {
+                                Err((previous, next))
+                            } else {
+                                previous.coalesce(next)
+                            }
+                        })
                         .map(|locations| CopyPackBlobs {
                             pack_id: pack.id,
                             locations,
@@ -1615,9 +1655,9 @@ pub(crate) fn prune_repository<S: Open>(
         if let Some(uploads) = uploads {
             uploads.finalize()?;
         }
-        copied?;
         _ = tree_result?;
         _ = data_result?;
+        copied?;
         indexer.write().unwrap().finalize()?;
         p.finish();
     }

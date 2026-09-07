@@ -1,3 +1,4 @@
+pub(crate) mod byte_budget;
 pub(crate) mod packer;
 pub(crate) mod tree;
 pub(crate) mod upload_pool;
