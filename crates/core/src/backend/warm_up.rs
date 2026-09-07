@@ -27,6 +27,10 @@ impl WarmUpAccessBackend {
 }
 
 impl ReadBackend for WarmUpAccessBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        self.be.connection_limit()
+    }
+
     fn location(&self) -> String {
         self.be.location()
     }

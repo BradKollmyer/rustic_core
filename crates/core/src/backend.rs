@@ -95,6 +95,13 @@ pub trait ReadBackend: Send + Sync + 'static {
     /// Returns the location of the backend.
     fn location(&self) -> String;
 
+    /// Configured maximum concurrent backend operations, if known.
+    /// Wrappers preserve this limit so callers can reserve capacity for writes.
+    /// `None` means no limit is advertised; implementations must not return zero.
+    fn connection_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Lists all files with their size of the given type.
     ///
     /// # Arguments
@@ -459,6 +466,10 @@ impl WriteBackend for Arc<dyn WriteBackend> {
 }
 
 impl ReadBackend for Arc<dyn WriteBackend> {
+    fn connection_limit(&self) -> Option<usize> {
+        self.deref().connection_limit()
+    }
+
     fn location(&self) -> String {
         self.deref().location()
     }

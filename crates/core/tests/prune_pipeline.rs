@@ -26,6 +26,7 @@ use tempfile::{TempDir, tempdir};
 #[derive(Default)]
 struct Metrics {
     enabled: AtomicBool,
+    connection_limit: AtomicUsize,
     reads: AtomicUsize,
     writes: AtomicUsize,
     peak_reads: AtomicUsize,
@@ -87,6 +88,13 @@ struct DelayedBackend {
     metrics: Arc<Metrics>,
 }
 impl ReadBackend for DelayedBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        match self.metrics.connection_limit.load(SeqCst) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     fn location(&self) -> String {
         self.inner.location()
     }
@@ -272,6 +280,45 @@ fn published_after_upload(repo: &Repository<OpenStatus>, metrics: &Metrics) -> R
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn backend_limits_reach_prune_through_cache_and_cap_overrides() -> Result<()> {
+    let seed = seed(32)?;
+    for (backend_limit, requested, expected) in [(5, None, 5), (3, Some(10), 3), (10, Some(3), 3)] {
+        let (_dir, _repo, backend) = trial(&seed)?;
+        let cache = tempdir()?;
+        let backends = RepositoryBackends::new(Arc::new(backend.clone()), None);
+        let repo = Repository::new(
+            &RepositoryOptions::default().cache_dir(cache.path()),
+            &backends,
+        )?
+        .open(&Credentials::Masterkey(seed.key.clone()))?;
+        let m = &backend.metrics;
+        m.connection_limit.store(backend_limit, SeqCst);
+        let opts = opts(requested, true).parallel_repack(true);
+        let plan = repo.prune_plan(&opts)?;
+        m.read_ms.store(15, SeqCst);
+        m.write_ms.store(35, SeqCst);
+        m.enabled.store(true, SeqCst);
+        repo.prune(&opts, plan)?;
+        assert!(m.peak.load(SeqCst) <= expected);
+        assert!(m.peak_reads.load(SeqCst) < expected);
+        assert!(m.peak_writes.load(SeqCst) > 1);
+        published_after_upload(&repo, m)?;
+        m.enabled.store(false, SeqCst);
+        repo.check(CheckOptions::default().read_data(true))?
+            .is_ok()?;
+    }
+    let (_dir, repo, backend) = trial(&seed)?;
+    backend.metrics.connection_limit.store(1, SeqCst);
+    let opts = opts(None, true).parallel_repack(true);
+    let plan = repo.prune_plan(&opts)?;
+    backend.metrics.enabled.store(true, SeqCst);
+    assert!(repo.prune(&opts, plan).is_err());
+    assert_eq!(backend.metrics.puts.load(SeqCst), 0);
+    assert_eq!(backend.metrics.deletes.load(SeqCst), 0);
     Ok(())
 }
 

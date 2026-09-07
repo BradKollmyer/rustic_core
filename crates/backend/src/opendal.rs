@@ -42,6 +42,7 @@ mod constants {
 #[derive(Clone, Debug)]
 pub struct OpenDALBackend {
     operator: Operator,
+    connections: Option<usize>,
 }
 
 /// Log `OpenDAL` retries as a single line using `Display`, not `Debug`.
@@ -156,6 +157,13 @@ impl OpenDALBackend {
             })
             .transpose()?;
 
+        if connections == Some(0) {
+            return Err(RusticError::new(
+                ErrorKind::InvalidInput,
+                "Backend connections must be greater than zero.",
+            ));
+        }
+
         let throttle = options
             .get("throttle")
             .map(|t| Throttle::from_str(t))
@@ -206,7 +214,10 @@ impl OpenDALBackend {
             .attach_context("path", path.as_ref().to_string())
         })?;
 
-        Ok(Self { operator })
+        Ok(Self {
+            operator,
+            connections,
+        })
     }
 
     /// Listing options used for repository (and source) listings.
@@ -324,6 +335,10 @@ impl OpenDALBackend {
 }
 
 impl ReadBackend for OpenDALBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        self.connections
+    }
+
     /// Returns the location of the backend.
     ///
     /// This is `opendal:<scheme>:<name>` (e.g., `opendal:gdrive:` for Google Drive).
@@ -655,6 +670,30 @@ mod tests {
 
         assert_eq!(backend.list_page_size(), expected);
         assert_eq!(backend.list_options(true).limit, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_configured_connection_limit_and_rejects_zero() -> Result<()> {
+        let options = BTreeMap::from([
+            ("region".into(), "test_region".into()),
+            ("bucket".into(), "test_bucket".into()),
+        ]);
+        assert_eq!(
+            OpenDALBackend::new("s3", options.clone())?.connection_limit(),
+            None
+        );
+        for n in [1, 5, 20] {
+            let mut options = options.clone();
+            _ = options.insert("connections".into(), n.to_string());
+            assert_eq!(
+                OpenDALBackend::new("s3", options)?.connection_limit(),
+                Some(n)
+            );
+        }
+        let mut options = options;
+        _ = options.insert("connections".into(), "0".into());
+        assert!(OpenDALBackend::new("s3", options).is_err());
         Ok(())
     }
 

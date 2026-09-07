@@ -217,8 +217,12 @@ pub struct PruneOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub fast_repack: bool,
 
-    /// Experimental shared I/O budget for repacking (at least 2).
-    #[cfg_attr(feature = "clap", clap(long, hide = true))]
+    /// Use bounded parallel pack uploads. Uses the backend connection limit, or 5 if unset.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub parallel_repack: bool,
+
+    /// Override parallel repack concurrency (at least 2), capped by the backend limit. Implies parallel-repack.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "N"))]
     pub repack_connections: Option<usize>,
 
     /// Repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
@@ -249,6 +253,25 @@ pub struct PruneOptions {
     pub ignore_snaps: Vec<SnapshotId>,
 }
 
+impl PruneOptions {
+    fn effective_repack_connections(
+        &self,
+        backend_limit: Option<usize>,
+    ) -> RusticResult<Option<usize>> {
+        if !self.parallel_repack && self.repack_connections.is_none() {
+            return Ok(None);
+        }
+        let requested = self.repack_connections.or(backend_limit).unwrap_or(5);
+        let effective = backend_limit.map_or(requested, |limit| requested.min(limit));
+        if effective < 2 {
+            return Err(RusticError::new(ErrorKind::InvalidInput,
+                "Parallel repack needs at least two backend connections to reserve upload capacity.")
+                .attach_context("connections", effective.to_string()));
+        }
+        Ok(Some(effective))
+    }
+}
+
 impl Default for PruneOptions {
     fn default() -> Self {
         Self {
@@ -260,6 +283,7 @@ impl Default for PruneOptions {
             early_delete_index: false,
             fast_repack: false,
             repack_connections: None,
+            parallel_repack: false,
             repack_uncompressed: false,
             repack_all: false,
             repack_cacheable_only: None,
@@ -1349,12 +1373,7 @@ pub(crate) fn prune_repository<S: Open>(
     opts: &PruneOptions,
     prune_plan: PrunePlan,
 ) -> RusticResult<()> {
-    if opts.repack_connections.is_some_and(|n| n < 2) {
-        return Err(RusticError::new(
-            ErrorKind::InvalidInput,
-            "Repack connections must be at least 2.",
-        ));
-    }
+    let connections = opts.effective_repack_connections(repo.dbe().connection_limit())?;
     if repo.config().append_only == Some(true) {
         return Err(RusticError::new(
             ErrorKind::AppendOnly,
@@ -1519,12 +1538,11 @@ pub(crate) fn prune_repository<S: Open>(
             PackSizer::fixed(PackSizer::from_config(repo.config(), blob_type, size).pack_size())
         });
 
-        let budget = opts.repack_connections.map(IoBudget::new);
+        let budget = connections.map(IoBudget::new);
         let uploads = budget
             .as_ref()
-            .map(|budget| UploadPool::new(be, &indexer, opts.repack_connections.unwrap(), budget));
-        let readers = opts
-            .repack_connections
+            .map(|budget| UploadPool::new(be, &indexer, connections.unwrap(), budget));
+        let readers = connections
             .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n - 1).build())
             .transpose()
             .map_err(|error| {

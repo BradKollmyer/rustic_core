@@ -41,6 +41,14 @@ impl HotColdBackend {
 }
 
 impl ReadBackend for HotColdBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        // Either route can service a repack operation; preserve the tighter cap.
+        match (self.be.connection_limit(), self.be_hot.connection_limit()) {
+            (Some(cold), Some(hot)) => Some(cold.min(hot)),
+            (cold, hot) => cold.or(hot),
+        }
+    }
+
     fn location(&self) -> String {
         self.be.location()
     }

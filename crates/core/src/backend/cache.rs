@@ -151,6 +151,10 @@ impl CachedBackend {
 }
 
 impl ReadBackend for CachedBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        self.be.connection_limit()
+    }
+
     /// Returns the location of the backend as a String.
     fn location(&self) -> String {
         self.be.location()

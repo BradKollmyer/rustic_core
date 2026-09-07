@@ -755,6 +755,10 @@ impl<C: CryptoKey> DecryptReadBackend for DecryptBackend<C> {
 }
 
 impl<C: CryptoKey> ReadBackend for DecryptBackend<C> {
+    fn connection_limit(&self) -> Option<usize> {
+        self.be.connection_limit()
+    }
+
     fn location(&self) -> String {
         self.be.location()
     }
