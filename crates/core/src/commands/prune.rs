@@ -1974,3 +1974,48 @@ mod used_id_hash_tests {
         assert_eq!(map.iter().count(), 2);
     }
 }
+
+#[cfg(all(test, feature = "clap"))]
+mod concurrency_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parallel_repack_cli_defaults_and_overrides() {
+        let default = PruneOptions::try_parse_from(["prune"]).unwrap();
+        assert_eq!(
+            default.effective_repack_connections(Some(10)).unwrap(),
+            None
+        );
+        assert_eq!(
+            default.repack_read_buffer,
+            PruneOptions::default().repack_read_buffer
+        );
+        assert_eq!(
+            default.repack_upload_buffer,
+            PruneOptions::default().repack_upload_buffer
+        );
+        let configured = PruneOptions::try_parse_from([
+            "prune",
+            "--parallel-repack",
+            "--repack-upload-buffer",
+            "1GiB",
+        ])
+        .unwrap();
+        assert_eq!(
+            configured.effective_repack_connections(None).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            configured.effective_repack_connections(Some(10)).unwrap(),
+            Some(10)
+        );
+        assert_eq!(configured.repack_upload_buffer, ByteSize::gib(1));
+        let explicit =
+            PruneOptions::try_parse_from(["prune", "--repack-connections", "10"]).unwrap();
+        assert_eq!(
+            explicit.effective_repack_connections(Some(5)).unwrap(),
+            Some(5)
+        );
+    }
+}

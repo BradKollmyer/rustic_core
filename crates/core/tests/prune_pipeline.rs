@@ -45,6 +45,8 @@ struct Metrics {
     peak_write_bytes: AtomicU64,
     read_ms: AtomicU64,
     write_ms: AtomicU64,
+    read_mib_per_second: AtomicU64,
+    write_mib_per_second: AtomicU64,
     failures: AtomicUsize,
     fail_read_at: AtomicUsize,
     stall: Mutex<bool>,
@@ -126,6 +128,16 @@ impl Drop for Active<'_> {
         self.metrics.active.fetch_sub(1, SeqCst);
     }
 }
+#[allow(clippy::cast_precision_loss)]
+fn transfer_delay(milliseconds: u64, bytes: u64, mib_per_second: u64) -> Duration {
+    Duration::from_millis(milliseconds)
+        + if mib_per_second == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(bytes as f64 / (mib_per_second as f64 * 1_048_576.0))
+        }
+}
+
 #[derive(Clone)]
 struct DelayedBackend {
     inner: LocalBackend,
@@ -164,7 +176,11 @@ impl ReadBackend for DelayedBackend {
             ));
         }
         self.metrics.read_bytes.fetch_add(u64::from(l), SeqCst);
-        thread::sleep(Duration::from_millis(self.metrics.read_ms.load(SeqCst)));
+        thread::sleep(transfer_delay(
+            self.metrics.read_ms.load(SeqCst),
+            u64::from(l),
+            self.metrics.read_mib_per_second.load(SeqCst),
+        ));
         let hold = HeldBytes::new(&self.metrics, u64::from(l), false);
         let data = self.inner.read_partial(t, id, c, o, l)?;
         Ok(Bytes::from_owner(TrackedRead { data, _hold: hold }))
@@ -206,7 +222,11 @@ impl WriteBackend for DelayedBackend {
                 ));
             }
             drop(stalled);
-            thread::sleep(Duration::from_millis(self.metrics.write_ms.load(SeqCst)));
+            thread::sleep(transfer_delay(
+                self.metrics.write_ms.load(SeqCst),
+                data.size() as u64,
+                self.metrics.write_mib_per_second.load(SeqCst),
+            ));
             if self
                 .metrics
                 .failures
@@ -239,6 +259,10 @@ struct Seed {
     key: MasterKey,
 }
 fn seed(mebibytes: usize) -> Result<Seed> {
+    seed_layout(mebibytes, 1, 64)
+}
+
+fn seed_layout(mebibytes: usize, pack_mib: u64, chunk_kib: u64) -> Result<Seed> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     fs::create_dir(&source)?;
@@ -247,8 +271,8 @@ fn seed(mebibytes: usize) -> Result<Seed> {
     let backends = RepositoryBackends::new(Arc::new(backend), None);
     let config = ConfigOptions::default()
         .set_chunker(Chunker::FixedSize)
-        .set_chunk_size(ByteSize::kib(64))
-        .set_datapack_size(ByteSize::mib(1))
+        .set_chunk_size(ByteSize::kib(chunk_kib))
+        .set_datapack_size(ByteSize::mib(pack_mib))
         .set_datapack_growfactor(0)
         .set_treepack_growfactor(0)
         .set_compression(1);
@@ -260,8 +284,10 @@ fn seed(mebibytes: usize) -> Result<Seed> {
         )?
         .to_indexed_ids()?;
     let mut random = 0x0123_4567_89ab_cdef_u64;
-    for file in 0..mebibytes * 16 {
-        let mut data = vec![0u8; 65_536];
+    let chunk_bytes = usize::try_from(chunk_kib * 1024)?;
+    let file_count = mebibytes * 1024 * 1024 / chunk_bytes;
+    for file in 0..file_count {
+        let mut data = vec![0u8; chunk_bytes];
         for block in data.chunks_exact_mut(8) {
             random ^= random << 13;
             random ^= random >> 7;
@@ -272,7 +298,7 @@ fn seed(mebibytes: usize) -> Result<Seed> {
     }
     let paths = PathList::from_iter([source.clone()]);
     let first = repo.backup(&BackupOptions::default(), &paths, SnapshotFile::default())?;
-    for file in (0..mebibytes * 16).step_by(2) {
+    for file in (0..file_count).step_by(2) {
         fs::remove_file(source.join(format!("{file:06}")))?;
     }
     let repo = repo.to_indexed_ids()?;
@@ -593,6 +619,20 @@ fn stalled_uploads_backpressure_downloads_and_resume() -> Result<()> {
     Ok(())
 }
 
+fn benchmark_value(name: &str, default: u64) -> u64 {
+    std::env::var(name).map_or(default, |value| {
+        value.parse().expect("numeric benchmark parameter")
+    })
+}
+
+fn benchmark_seed() -> Result<Seed> {
+    seed_layout(
+        usize::try_from(benchmark_value("PRUNE_LAB_MIB", 128))?,
+        benchmark_value("PRUNE_LAB_PACK_MIB", 1),
+        benchmark_value("PRUNE_LAB_CHUNK_KIB", 64),
+    )
+}
+
 #[test]
 #[ignore = "local latency benchmark; run explicitly with --ignored --nocapture"]
 #[allow(clippy::cast_precision_loss)]
@@ -607,13 +647,13 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 key: serde_json::from_slice(&fs::read(path.join("key.json"))?)?,
             }
         } else {
-            let seed = seed(128)?;
+            let seed = benchmark_seed()?;
             copy_dir(&seed.dir.path().join("repo"), &path.join("repo"))?;
             fs::write(path.join("key.json"), serde_json::to_vec(&seed.key)?)?;
             seed
         }
     } else {
-        seed(128)?
+        benchmark_seed()?
     };
     println!("case,repeat,seconds,read_mib,write_mib,peak_get,peak_put,peak_io,overlap");
     for (name, read_ms, write_ms) in [("local", 0, 0), ("latency", 20, 60)] {
@@ -634,10 +674,24 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 }
                 let (_dir, repo, backend) = trial(&seed)?;
                 let m = &backend.metrics;
-                let opts = opts(n, false);
+                let opts = opts(n, false)
+                    .repack_read_buffer(ByteSize::mib(benchmark_value(
+                        "PRUNE_LAB_READ_BUFFER_MIB",
+                        128,
+                    )))
+                    .repack_upload_buffer(ByteSize::mib(benchmark_value(
+                        "PRUNE_LAB_UPLOAD_BUFFER_MIB",
+                        256,
+                    )));
                 let plan = repo.prune_plan(&opts)?;
                 m.read_ms.store(read_ms, SeqCst);
                 m.write_ms.store(write_ms, SeqCst);
+                if name == "latency" {
+                    m.read_mib_per_second
+                        .store(benchmark_value("PRUNE_LAB_READ_MIBPS", 0), SeqCst);
+                    m.write_mib_per_second
+                        .store(benchmark_value("PRUNE_LAB_WRITE_MIBPS", 0), SeqCst);
+                }
                 m.enabled.store(true, SeqCst);
                 println!("BEGIN {case}");
                 let start = Instant::now();
