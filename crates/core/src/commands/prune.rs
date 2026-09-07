@@ -29,6 +29,7 @@ use crate::{
         BlobId, BlobLocations, BlobType, BlobTypeMap, Initialize,
         packer::{BlobCopier, CopyPackBlobs, PackSizer},
         tree::{OnTreeLoad, TreeStreamer, UsedBlobsTree},
+        upload_pool::{IoBudget, UploadPool},
     },
     error::{ErrorKind, RusticError, RusticResult},
     index::{
@@ -216,6 +217,10 @@ pub struct PruneOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub fast_repack: bool,
 
+    /// Experimental shared I/O budget for repacking (at least 2).
+    #[cfg_attr(feature = "clap", clap(long, hide = true))]
+    pub repack_connections: Option<usize>,
+
     /// Repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
     /// Implies --max-unused=0.
     #[cfg_attr(feature = "clap", clap(long, conflicts_with = "fast_repack"))]
@@ -254,6 +259,7 @@ impl Default for PruneOptions {
             instant_delete: false,
             early_delete_index: false,
             fast_repack: false,
+            repack_connections: None,
             repack_uncompressed: false,
             repack_all: false,
             repack_cacheable_only: None,
@@ -1343,6 +1349,12 @@ pub(crate) fn prune_repository<S: Open>(
     opts: &PruneOptions,
     prune_plan: PrunePlan,
 ) -> RusticResult<()> {
+    if opts.repack_connections.is_some_and(|n| n < 2) {
+        return Err(RusticError::new(
+            ErrorKind::InvalidInput,
+            "Repack connections must be at least 2.",
+        ));
+    }
     if repo.config().append_only == Some(true) {
         return Err(RusticError::new(
             ErrorKind::AppendOnly,
@@ -1507,54 +1519,87 @@ pub(crate) fn prune_repository<S: Open>(
             PackSizer::fixed(PackSizer::from_config(repo.config(), blob_type, size).pack_size())
         });
 
-        let tree_repacker = BlobCopier::new(
+        let budget = opts.repack_connections.map(IoBudget::new);
+        let uploads = budget
+            .as_ref()
+            .map(|budget| UploadPool::new(be, &indexer, opts.repack_connections.unwrap(), budget));
+        let readers = opts
+            .repack_connections
+            .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n - 1).build())
+            .transpose()
+            .map_err(|error| {
+                RusticError::with_source(
+                    ErrorKind::Internal,
+                    "Cannot start prune download workers.",
+                    error,
+                )
+            })?;
+
+        let tree_repacker = BlobCopier::new_with_uploads(
             be.clone(),
             be.clone(),
             BlobType::Tree,
             indexer.clone(),
             pack_sizer[BlobType::Tree],
+            uploads.as_ref().map(UploadPool::sender),
+            budget.clone(),
         )?;
 
-        let data_repacker = BlobCopier::new(
+        let data_repacker = BlobCopier::new_with_uploads(
             be.clone(),
             be.clone(),
             BlobType::Data,
             indexer.clone(),
             pack_sizer[BlobType::Data],
+            uploads.as_ref().map(UploadPool::sender),
+            budget,
         )?;
 
         // write new pack files and index files
-        repack_packs
-            .into_par_iter()
-            .try_for_each(|pack| -> RusticResult<_> {
-                let repacker = match pack.blob_type {
-                    BlobType::Data => &data_repacker,
-                    BlobType::Tree => &tree_repacker,
-                };
-                let blob_chunks: Vec<_> = pack
-                    .blobs
-                    .into_iter()
-                    .map(|blob| BlobLocations::from_blob_location(blob.location, blob.id))
-                    .coalesce(BlobLocations::coalesce)
-                    .map(|locations| CopyPackBlobs {
-                        pack_id: pack.id,
-                        locations,
-                    })
-                    .collect();
+        let copy = || {
+            repack_packs
+                .into_par_iter()
+                .try_for_each(|pack| -> RusticResult<_> {
+                    let repacker = match pack.blob_type {
+                        BlobType::Data => &data_repacker,
+                        BlobType::Tree => &tree_repacker,
+                    };
+                    let blob_chunks: Vec<_> = pack
+                        .blobs
+                        .into_iter()
+                        .map(|blob| BlobLocations::from_blob_location(blob.location, blob.id))
+                        .coalesce(BlobLocations::coalesce)
+                        .map(|locations| CopyPackBlobs {
+                            pack_id: pack.id,
+                            locations,
+                        })
+                        .collect();
 
-                // Range-GETs for holes in the same pack run in parallel. The
-                // packer already serializes writes via its channel / lock.
-                blob_chunks.into_par_iter().try_for_each(|blobs| {
-                    if opts.fast_repack {
-                        repacker.copy_fast(blobs, &p)
-                    } else {
-                        repacker.copy(blobs, &p)
-                    }
-                })?;
-                Ok(())
-            })?;
-        _ = tree_repacker.finalize()?;
-        _ = data_repacker.finalize()?;
+                    // With a dedicated pool, each reader retains its worker slot
+                    // through the handoff to the packer, bounding downloaded buffers.
+                    blob_chunks.into_par_iter().try_for_each(|blobs| {
+                        if opts.fast_repack {
+                            repacker.copy_fast(blobs, &p)
+                        } else {
+                            repacker.copy(blobs, &p)
+                        }
+                    })?;
+                    Ok(())
+                })
+        };
+        let copied = match readers {
+            Some(pool) => pool.install(copy),
+            None => copy(),
+        };
+        // Always close both producers and join uploads, including after a read/send failure.
+        let tree_result = tree_repacker.finalize();
+        let data_result = data_repacker.finalize();
+        if let Some(uploads) = uploads {
+            uploads.finalize()?;
+        }
+        copied?;
+        _ = tree_result?;
+        _ = data_result?;
         indexer.write().unwrap().finalize()?;
         p.finish();
     }

@@ -1,5 +1,6 @@
 pub(crate) mod packer;
 pub(crate) mod tree;
+pub(crate) mod upload_pool;
 
 use std::{cmp::Ordering, num::NonZeroU32};
 

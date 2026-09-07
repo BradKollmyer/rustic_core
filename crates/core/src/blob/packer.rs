@@ -1,3 +1,4 @@
+use super::upload_pool::{IoBudget, UploadSender};
 use std::{
     num::NonZeroU32,
     sync::{Arc, RwLock},
@@ -240,11 +241,23 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
         indexer: SharedIndexer<BE>,
         pack_sizer: PackSizer,
     ) -> RusticResult<Self> {
+        Self::new_with_uploads(be, blob_type, indexer, pack_sizer, None)
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn new_with_uploads(
+        be: BE,
+        blob_type: BlobType,
+        indexer: SharedIndexer<BE>,
+        pack_sizer: PackSizer,
+        uploads: Option<UploadSender>,
+    ) -> RusticResult<Self> {
         let raw_packer = Arc::new(RwLock::new(RawPacker::new(
             be.clone(),
             blob_type,
             indexer.clone(),
             pack_sizer,
+            uploads,
         )));
 
         let (tx, rx) = bounded(0);
@@ -414,6 +427,7 @@ pub(crate) struct RawPacker<BE: DecryptWriteBackend> {
     be: BE,
     /// The actor to write the pack file
     file_writer: Option<Actor>,
+    shared_uploads: Option<UploadSender>,
 }
 
 impl<BE: DecryptWriteBackend> RawPacker<BE> {
@@ -430,21 +444,30 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
     /// * `indexer` - The indexer to write to.
     /// * `config` - The config file.
     /// * `total_size` - The total size of the pack file.
-    fn new(be: BE, blob_type: BlobType, indexer: SharedIndexer<BE>, pack_sizer: PackSizer) -> Self {
-        let file_writer = Some(Actor::new(
-            FileWriterHandle {
-                be: be.clone(),
-                indexer,
-                cacheable: blob_type.is_cacheable(),
-            },
-            1,
-            1,
-        ));
+    fn new(
+        be: BE,
+        blob_type: BlobType,
+        indexer: SharedIndexer<BE>,
+        pack_sizer: PackSizer,
+        shared_uploads: Option<UploadSender>,
+    ) -> Self {
+        let file_writer = shared_uploads.is_none().then(|| {
+            Actor::new(
+                FileWriterHandle {
+                    be: be.clone(),
+                    indexer,
+                    cacheable: blob_type.is_cacheable(),
+                },
+                1,
+                1,
+            )
+        });
 
         Self {
             basic: BasicPacker::new(blob_type, pack_sizer),
             be,
             file_writer,
+            shared_uploads,
         }
     }
 
@@ -458,7 +481,10 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
             self.save()?;
         }
 
-        self.file_writer.take().unwrap().finalize()?;
+        drop(self.shared_uploads.take());
+        if let Some(writer) = self.file_writer.take() {
+            writer.finalize()?;
+        }
 
         Ok(self.basic.take_stats())
     }
@@ -511,6 +537,9 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
 
         // write file to backend
         let (file, index) = self.basic.take_data();
+        if let Some(uploads) = &self.shared_uploads {
+            return uploads.send(file, index, self.basic.blob_type.is_cacheable());
+        }
         self.file_writer
             .as_ref()
             .unwrap()
@@ -772,16 +801,16 @@ impl BasicPacker {
 #[derive(Clone)]
 pub(crate) struct FileWriterHandle<BE: DecryptWriteBackend> {
     /// The backend to write to.
-    be: BE,
+    pub(super) be: BE,
     /// The shared indexer containing the backend.
-    indexer: SharedIndexer<BE>,
+    pub(super) indexer: SharedIndexer<BE>,
     /// Whether the file is cacheable.
-    cacheable: bool,
+    pub(super) cacheable: bool,
 }
 
 impl<BE: DecryptWriteBackend> FileWriterHandle<BE> {
     // TODO: add documentation
-    fn process(&self, load: (BytesList, PackId, IndexPack)) -> RusticResult<IndexPack> {
+    pub(super) fn process(&self, load: (BytesList, PackId, IndexPack)) -> RusticResult<IndexPack> {
         let (file, id, mut index) = load;
         index.id = id;
         self.be
@@ -790,7 +819,7 @@ impl<BE: DecryptWriteBackend> FileWriterHandle<BE> {
         Ok(index)
     }
 
-    fn index(&self, index: IndexPack) -> RusticResult<()> {
+    pub(super) fn index(&self, index: IndexPack) -> RusticResult<()> {
         self.indexer.write().unwrap().add(index)?;
         Ok(())
     }
@@ -921,6 +950,7 @@ where
     packer: Packer<BE>,
     /// the blob type
     blob_type: BlobType,
+    budget: Option<IoBudget>,
 }
 
 impl<BE: DecryptFullBackend> BlobCopier<BE> {
@@ -948,11 +978,24 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
         indexer: SharedIndexer<BE>,
         pack_sizer: PackSizer,
     ) -> RusticResult<Self> {
-        let packer = Packer::new(be_dst, blob_type, indexer, pack_sizer)?;
+        Self::new_with_uploads(be_src, be_dst, blob_type, indexer, pack_sizer, None, None)
+    }
+
+    pub(crate) fn new_with_uploads(
+        be_src: BE,
+        be_dst: BE,
+        blob_type: BlobType,
+        indexer: SharedIndexer<BE>,
+        pack_sizer: PackSizer,
+        uploads: Option<UploadSender>,
+        budget: Option<IoBudget>,
+    ) -> RusticResult<Self> {
+        let packer = Packer::new_with_uploads(be_dst, blob_type, indexer, pack_sizer, uploads)?;
         Ok(Self {
             be_src,
             packer,
             blob_type,
+            budget,
         })
     }
 
@@ -969,6 +1012,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
     /// * If reading the blob from the backend fails
     pub fn copy_fast(&self, pack_blobs: CopyPackBlobs, p: &Progress) -> RusticResult<()> {
         let offset = pack_blobs.locations.offset;
+        let permit = self.budget.as_ref().map(IoBudget::acquire);
         let data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,
@@ -976,6 +1020,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
             offset,
             pack_blobs.locations.length,
         )?;
+        drop(permit);
 
         // TODO: write in parallel
         for (blob, blob_id) in pack_blobs.locations.blobs {
@@ -1016,6 +1061,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
     /// * If reading the blob from the backend fails
     pub fn copy(&self, pack_blobs: CopyPackBlobs, p: &Progress) -> RusticResult<()> {
         let offset = pack_blobs.locations.offset;
+        let permit = self.budget.as_ref().map(IoBudget::acquire);
         let read_data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,
@@ -1023,6 +1069,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
             offset,
             pack_blobs.locations.length,
         )?;
+        drop(permit);
 
         // TODO: write in parallel
         for (blob, blob_id) in pack_blobs.locations.blobs {
