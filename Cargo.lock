@@ -5359,8 +5359,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "storj"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b747415364aaa659be7f250e5b3befa14e45d56ffa8c68294d5b36ee57b6e89"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -5380,8 +5379,7 @@ dependencies = [
 [[package]]
 name = "storj-access"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfb64814d6a8da3d146a8f81a2e1624a5eabd22120815fe0504aa9a3b865ab6f"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "bs58",
  "getrandom 0.4.3",
@@ -5395,8 +5393,7 @@ dependencies = [
 [[package]]
 name = "storj-ec"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db2a3ae60181676381b3fa400fda701bd50dde3421ec6628df832ea5323502e2"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "thiserror",
 ]
@@ -5404,8 +5401,7 @@ dependencies = [
 [[package]]
 name = "storj-encryption"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74874940e3f936859aa94724b98d6ea89dfc6923cf1eb74f9c19b9defb58d613"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5419,8 +5415,7 @@ dependencies = [
 [[package]]
 name = "storj-proto"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "691e34ade35025085fb900cf91a1b125be1d40481a6177172f25b647f2c35b4f"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "prost",
  "prost-types",
@@ -5431,8 +5426,7 @@ dependencies = [
 [[package]]
 name = "storj-rpc"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "410de7b2b898348627a32e60fcbf4b86d832809941ff17b09a55838c790c4c79"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "bs58",
  "p256",
@@ -5448,8 +5442,7 @@ dependencies = [
 [[package]]
 name = "storj-uplink"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d3d5d757c863473bbafe39bd57f39977c6267a7d1d389113bfeccf6c124dee"
+source = "git+https://github.com/BradKollmyer/storj-uplink.git?rev=f4e5374e524da86dcd4cde38c302813df173dba9#f4e5374e524da86dcd4cde38c302813df173dba9"
 dependencies = [
  "blake3",
  "ed25519-dalek",

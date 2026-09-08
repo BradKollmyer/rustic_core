@@ -8,6 +8,10 @@ members = [
 ]
 resolver = "3"
 
+# Pin the retry-classification API until a crates.io release includes it.
+[patch.crates-io]
+storj = { git = "https://github.com/BradKollmyer/storj-uplink.git", rev = "f4e5374e524da86dcd4cde38c302813df173dba9" }
+
 [workspace.package]
 rust-version = "1.91.0"
 
