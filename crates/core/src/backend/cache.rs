@@ -49,8 +49,7 @@ fn open_file_capacity() -> usize {
 fn open_file_capacity_from_soft_limit(soft: impl Into<u64>) -> usize {
     usize::try_from(soft.into().saturating_sub(constants::OPEN_FILE_RESERVE))
         .unwrap_or(usize::MAX)
-        .min(constants::OPEN_FILE_CAPACITY)
-        .max(1)
+        .clamp(1, constants::OPEN_FILE_CAPACITY)
 }
 
 struct CachedFile {
