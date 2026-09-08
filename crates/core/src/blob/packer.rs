@@ -1,6 +1,7 @@
 use super::byte_budget::ByteBudget;
 use super::upload_pool::{IoBudget, UploadSender};
 use std::{
+    collections::HashSet,
     num::NonZeroU32,
     sync::{Arc, RwLock},
     thread::scope,
@@ -587,6 +588,8 @@ pub(crate) struct BasicPacker {
     created: SystemTime,
     /// The index of the pack
     index: IndexPack,
+    /// Membership checks must not scan the growing pack index on each append.
+    blob_ids: HashSet<BlobId>,
     /// The pack sizer
     pack_sizer: PackSizer,
     /// The packer stats
@@ -608,6 +611,7 @@ impl BasicPacker {
             count: 0,
             created: SystemTime::now(),
             index: IndexPack::default(),
+            blob_ids: HashSet::new(),
             pack_sizer,
             stats: PackerStats::default(),
         }
@@ -691,6 +695,7 @@ impl BasicPacker {
 
         self.index
             .add(*id, self.blob_type, offset, len, uncompressed_length);
+        _ = self.blob_ids.insert(*id);
         self.count += 1;
 
         Ok(())
@@ -788,6 +793,7 @@ impl BasicPacker {
     pub fn take_data(&mut self) -> (BytesList, IndexPack) {
         self.size = 0;
         self.pack_sizer.add_size(self.index.pack_size());
+        self.blob_ids.clear();
         self.count = 0;
         self.created = SystemTime::now();
         (
@@ -801,7 +807,7 @@ impl BasicPacker {
     }
 
     pub fn has(&self, id: &BlobId) -> bool {
-        self.index.blobs.iter().any(|b| &b.id == id)
+        self.blob_ids.contains(id)
     }
 }
 
@@ -1141,6 +1147,34 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
 mod tests {
     use super::*;
     use insta::assert_ron_snapshot;
+
+    #[test]
+    fn duplicate_blobs_are_skipped_only_within_the_current_pack() {
+        let mut packer = BasicPacker::new(BlobType::Data, PackSizer::fixed(1024));
+        let first = BlobId::from(crate::crypto::hasher::hash(b"first"));
+        let second = BlobId::from(crate::crypto::hasher::hash(b"second"));
+        for id in [first, second, first] {
+            packer
+                .add_raw(Bytes::from_static(b"data"), &id, 4, None)
+                .unwrap();
+        }
+        assert!(packer.has(&first));
+        let (data, index) = packer.take_data();
+        assert_eq!(data.size(), 8);
+        assert_eq!(index.blobs.len(), 2);
+        assert_eq!(index.blobs[0].id, first);
+        assert_eq!(index.blobs[1].id, second);
+        assert_eq!(index.blobs[1].location.offset, 4);
+        assert!(!packer.has(&first));
+        assert!(!packer.has(&second));
+        packer
+            .add_raw(Bytes::from_static(b"data"), &first, 4, None)
+            .unwrap();
+        let (_, index) = packer.take_data();
+        assert_eq!(index.blobs.len(), 1);
+        assert_eq!(index.blobs[0].location.offset, 0);
+        assert_eq!(packer.take_stats().blobs, 3);
+    }
 
     #[test]
     fn pack_sizers() {
