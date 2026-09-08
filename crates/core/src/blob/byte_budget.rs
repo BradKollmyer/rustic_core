@@ -1,6 +1,6 @@
 //! Weighted permits for the two independent repack buffer stages.
 use crate::error::{ErrorKind, RusticError, RusticResult};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Default)]
 struct State {
@@ -21,6 +21,14 @@ pub(crate) struct BytePermit {
     bytes: u64,
 }
 impl ByteBudget {
+    fn lock_state(&self) -> MutexGuard<'_, State> {
+        self.0.state.lock().unwrap_or_else(|poisoned| {
+            let mut state = poisoned.into_inner();
+            state.cancelled = true;
+            self.0.wake.notify_all();
+            state
+        })
+    }
     pub(crate) fn new(limit: u64, option: &'static str) -> Self {
         Self(Arc::new(Inner {
             limit,
@@ -42,9 +50,14 @@ impl ByteBudget {
             .attach_context("required_bytes", bytes.to_string())
             .attach_context("budget_bytes", self.0.limit.to_string()));
         }
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.lock_state();
         while !state.cancelled && bytes > self.0.limit - state.used {
-            state = self.0.wake.wait(state).unwrap();
+            state = self.0.wake.wait(state).unwrap_or_else(|poisoned| {
+                let mut state = poisoned.into_inner();
+                state.cancelled = true;
+                self.0.wake.notify_all();
+                state
+            });
         }
         if state.cancelled {
             return Err(RusticError::new(
@@ -61,16 +74,16 @@ impl ByteBudget {
         })
     }
     pub(crate) fn cancel(&self) {
-        self.0.state.lock().unwrap().cancelled = true;
+        self.lock_state().cancelled = true;
         self.0.wake.notify_all();
     }
     pub(crate) fn peak(&self) -> u64 {
-        self.0.state.lock().unwrap().peak
+        self.lock_state().peak
     }
 }
 impl Drop for BytePermit {
     fn drop(&mut self) {
-        self.budget.0.state.lock().unwrap().used -= self.bytes;
+        self.budget.lock_state().used -= self.bytes;
         self.budget.0.wake.notify_all();
     }
 }
@@ -97,6 +110,25 @@ impl RepackBuffers {
 mod tests {
     use super::*;
     use std::{sync::mpsc, thread, time::Duration};
+
+    #[test]
+    fn poisoned_state_cancels_waiters_and_allows_permit_cleanup() {
+        let budget = ByteBudget::new(10, "test");
+        let permit = budget.acquire(10).unwrap();
+        let other = budget.clone();
+        assert!(
+            thread::spawn(move || {
+                let _state = other.0.state.lock().unwrap();
+                panic!("poison resource state");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| drop(permit)).is_ok());
+        assert!(budget.acquire(1).is_err());
+        budget.cancel();
+        assert_eq!(budget.lock_state().used, 0);
+    }
 
     #[test]
     fn byte_wait_resumes_on_release_and_never_exceeds_limit() {
