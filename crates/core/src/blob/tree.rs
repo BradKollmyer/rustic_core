@@ -758,7 +758,7 @@ impl<T: LoadedTree> TreeStreamer<T> {
     }
 
     /// Like [`Self::new`], but each loader thread gets its own `on_load` from
-    /// `factory` so prune can fill a thread-local used-id map with no locks.
+    /// `factory`, allowing callers to keep per-loader callback state.
     pub fn new_with_on_load<BE, I, F, H>(
         be: &BE,
         index: &I,

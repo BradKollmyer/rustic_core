@@ -30,6 +30,9 @@ pub(crate) struct SortedEntry {
 const ENTRY_CHUNK_LEN: usize = if cfg!(test) { 4 } else { 1 << 20 };
 
 /// Append-only vec of bounded chunks. Lookups binary-search every chunk.
+/// With K chunks of at most C entries, a miss costs O(K log C), rather than
+/// one O(log N) search. This trades per-blob dedup lookup cost for bounded
+/// allocations while collecting very large indexes.
 #[derive(Debug)]
 pub(crate) struct Chunked<T> {
     chunks: Vec<Vec<T>>,
