@@ -11,14 +11,10 @@ use crate::{
     index::indexer::SharedIndexer,
     repofile::{indexfile::IndexPack, packfile::PackId},
 };
-use crossbeam_channel::{RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased};
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread::JoinHandle,
-    time::Duration,
 };
 
 #[derive(Clone)]
@@ -35,21 +31,48 @@ impl IoBudget {
     }
 }
 
+#[derive(Clone)]
+struct StopSignal {
+    sender: Arc<Mutex<Option<Sender<()>>>>,
+    receiver: Receiver<()>,
+}
+impl StopSignal {
+    fn new() -> Self {
+        let (sender, receiver) = bounded(0);
+        Self {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            receiver,
+        }
+    }
+    fn cancel(&self) {
+        // Disconnect broadcasts cancellation to every sender and worker.
+        drop(self.sender.lock().unwrap().take());
+    }
+    fn check(&self) -> RusticResult<()> {
+        if matches!(self.receiver.try_recv(), Err(TryRecvError::Empty)) {
+            Ok(())
+        } else {
+            Err(Self::error())
+        }
+    }
+    fn error() -> Box<RusticError> {
+        RusticError::new(
+            ErrorKind::Backend,
+            "Pack upload pool stopped after a failure.",
+        )
+    }
+}
+
 type Job = (BytesList, IndexPack, bool, BytePermit);
 #[derive(Clone)]
 pub(crate) struct UploadSender {
     tx: Sender<Job>,
-    stopped: Arc<AtomicBool>,
+    stopped: StopSignal,
     buffers: RepackBuffers,
 }
 impl UploadSender {
     pub(crate) fn reserve(&self, bytes: u64) -> RusticResult<BytePermit> {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(RusticError::new(
-                ErrorKind::Backend,
-                "Pack upload pool stopped after a failure.",
-            ));
-        }
+        self.stopped.check()?;
         self.buffers.uploads.acquire(bytes)
     }
 
@@ -60,16 +83,21 @@ impl UploadSender {
         cacheable: bool,
         bytes: BytePermit,
     ) -> RusticResult<()> {
-        self.tx
-            .send((file, index, cacheable, bytes))
-            .map_err(|_| RusticError::new(ErrorKind::Backend, "Pack upload pool disconnected."))
+        self.stopped.check()?;
+        select_biased! {
+            recv(self.stopped.receiver) -> _ => return Err(StopSignal::error()),
+            send(self.tx, (file, index, cacheable, bytes)) -> result => {
+                result.map_err(|_| RusticError::new(ErrorKind::Backend, "Pack upload pool disconnected."))?;
+            }
+        }
+        self.stopped.check()
     }
 }
 
 pub(crate) struct UploadPool {
     sender: Option<UploadSender>,
     workers: Vec<JoinHandle<()>>,
-    stopped: Arc<AtomicBool>,
+    stopped: StopSignal,
     errors: Arc<Mutex<Vec<RusticError>>>,
     budget: IoBudget,
     buffers: RepackBuffers,
@@ -83,7 +111,7 @@ impl UploadPool {
         buffers: &RepackBuffers,
     ) -> Self {
         let (tx, rx) = bounded::<Job>(0);
-        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped = StopSignal::new();
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut workers = Vec::new();
         for _ in 0..n {
@@ -97,14 +125,15 @@ impl UploadPool {
             );
             let buffers = buffers.clone();
             workers.push(std::thread::spawn(move || {
-                while !stopped.load(Ordering::Acquire) {
-                    let (file, index, cacheable, _bytes) =
-                        match rx.recv_timeout(Duration::from_millis(50)) {
+                loop {
+                    let (file, index, cacheable, _bytes) = select_biased! {
+                        recv(stopped.receiver) -> _ => break,
+                        recv(rx) -> job => match job {
                             Ok(job) => job,
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => break,
-                        };
-                    if stopped.load(Ordering::Acquire) {
+                            Err(_) => break,
+                        },
+                    };
+                    if stopped.check().is_err() {
                         break;
                     }
                     let id = PackId::from(
@@ -113,7 +142,7 @@ impl UploadPool {
                     let Ok(_permit) = budget.acquire() else {
                         break;
                     };
-                    if stopped.load(Ordering::Acquire) {
+                    if stopped.check().is_err() {
                         break;
                     }
                     let writer = FileWriterHandle {
@@ -129,7 +158,7 @@ impl UploadPool {
                             .lock()
                             .unwrap()
                             .push(*error.attach_context("pack_id", id.to_string()));
-                        stopped.store(true, Ordering::Release);
+                        stopped.cancel();
                         budget.cancel();
                         buffers.cancel();
                     }
@@ -150,7 +179,10 @@ impl UploadPool {
         }
     }
     pub(crate) fn sender(&self) -> UploadSender {
-        self.sender.as_ref().unwrap().clone()
+        self.sender
+            .as_ref()
+            .expect("sender requested before pool finalization")
+            .clone()
     }
     fn join(&mut self) {
         drop(self.sender.take());
@@ -188,7 +220,7 @@ impl UploadPool {
 }
 impl Drop for UploadPool {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
+        self.stopped.cancel();
         self.budget.cancel();
         self.buffers.cancel();
         self.join();
@@ -198,6 +230,70 @@ impl Drop for UploadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_rejects_reserved_upload_without_disconnecting_workers() {
+        let (tx, rx) = bounded(1);
+        let stopped = StopSignal::new();
+        let buffers = RepackBuffers::new(1, 1);
+        let sender = UploadSender {
+            tx,
+            stopped: stopped.clone(),
+            buffers: buffers.clone(),
+        };
+        let bytes = sender.reserve(1).unwrap();
+        stopped.cancel();
+        assert!(
+            sender
+                .send(vec![0].into(), IndexPack::default(), false, bytes)
+                .is_err()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled job was handed to a worker"
+        );
+        assert!(sender.reserve(1).is_err());
+        // The rejected job returned its bytes even though the worker is still alive.
+        assert!(buffers.uploads.acquire(1).is_ok());
+    }
+
+    #[test]
+    fn cancellation_wakes_all_blocked_upload_senders() {
+        let (tx, rx) = bounded(0);
+        let stopped = StopSignal::new();
+        let buffers = RepackBuffers::new(1, 3);
+        let sender = UploadSender {
+            tx,
+            stopped: stopped.clone(),
+            buffers: buffers.clone(),
+        };
+        let (done_tx, done_rx) = bounded(3);
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            let bytes = sender.reserve(1).unwrap();
+            let sender = sender.clone();
+            let done = done_tx.clone();
+            threads.push(std::thread::spawn(move || {
+                let result = sender.send(vec![0].into(), IndexPack::default(), false, bytes);
+                let _ = done.send(result.is_err());
+            }));
+        }
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        stopped.cancel();
+        let results: Vec<_> = (0..3)
+            .map(|_| done_rx.recv_timeout(Duration::from_secs(1)))
+            .collect();
+        // Keep the work receiver connected until every sender has been woken by cancellation.
+        drop(rx);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        for result in results {
+            assert!(result.unwrap());
+        }
+        assert!(buffers.uploads.acquire(3).is_ok());
+    }
 
     #[test]
     fn cancellation_wakes_io_waiter_without_releasing_active_permit() {

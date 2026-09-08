@@ -29,10 +29,16 @@ packs. The completed-pack channel is unbuffered. A download worker keeps its
 slot until it has handed the blobs to the packer, so producers cannot keep
 fetching indefinitely while uploads are blocked.
 
-A pack enters the index only after its upload succeeds. On failure, memory
-waiters are cancelled, both packers are closed, and all upload workers are
-joined. Backend errors retain pack IDs and aggregated failure details. Prune
-returns before its subsequent old-index and pack deletion phase.
+A pack enters the index only after its upload succeeds. On failure, I/O and
+memory waiters are cancelled, blocked channel senders and workers are woken,
+both packers are closed, and all upload workers are joined. Backend errors
+retain pack IDs and aggregated failure details. Prune returns before its
+subsequent old-index and pack deletion phase.
+
+A successful channel handoff schedules an upload; only pool finalization
+confirms completion. Cancellation may discard accepted work that has not
+started, and finalization returns the upload failure. Backend calls already
+in progress must return before their workers can be joined.
 
 This does not override `--early-delete-index` or the existing cleanup of
 already-unindexed files before repacking. Avoid early deletion if preserving
