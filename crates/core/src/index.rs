@@ -17,6 +17,7 @@ use crate::{
 
 pub(crate) mod binarysorted;
 pub(crate) mod indexer;
+mod upload_pool;
 
 /// An entry in the index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Constructor)]

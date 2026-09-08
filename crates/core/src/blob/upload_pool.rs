@@ -32,34 +32,34 @@ impl IoBudget {
 }
 
 #[derive(Clone)]
-struct StopSignal {
+pub(crate) struct StopSignal {
     sender: Arc<Mutex<Option<Sender<()>>>>,
     receiver: Receiver<()>,
 }
 impl StopSignal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (sender, receiver) = bounded(0);
         Self {
             sender: Arc::new(Mutex::new(Some(sender))),
             receiver,
         }
     }
-    fn cancel(&self) {
+    pub(crate) fn receiver(&self) -> &Receiver<()> {
+        &self.receiver
+    }
+    pub(crate) fn cancel(&self) {
         // Disconnect broadcasts cancellation to every sender and worker.
         drop(self.sender.lock().unwrap().take());
     }
-    fn check(&self) -> RusticResult<()> {
+    pub(crate) fn check(&self) -> RusticResult<()> {
         if matches!(self.receiver.try_recv(), Err(TryRecvError::Empty)) {
             Ok(())
         } else {
             Err(Self::error())
         }
     }
-    fn error() -> Box<RusticError> {
-        RusticError::new(
-            ErrorKind::Backend,
-            "Pack upload pool stopped after a failure.",
-        )
+    pub(crate) fn error() -> Box<RusticError> {
+        RusticError::new(ErrorKind::Backend, "Upload pool stopped after a failure.")
     }
 }
 

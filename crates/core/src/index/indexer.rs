@@ -6,6 +6,8 @@ use std::{
 
 use log::warn;
 
+use super::upload_pool::IndexUploadPool;
+
 use crate::{
     backend::decrypt::DecryptWriteBackend,
     blob::BlobId,
@@ -40,6 +42,7 @@ where
     created: SystemTime,
     /// The set of indexed blob ids.
     indexed: Option<BTreeSet<BlobId>>,
+    uploads: Option<IndexUploadPool>,
 }
 
 impl<BE: DecryptWriteBackend> Indexer<BE> {
@@ -59,6 +62,7 @@ impl<BE: DecryptWriteBackend> Indexer<BE> {
             count: 0,
             created: SystemTime::now(),
             indexed: Some(BTreeSet::new()),
+            uploads: None,
         }
     }
 
@@ -78,7 +82,30 @@ impl<BE: DecryptWriteBackend> Indexer<BE> {
             count: 0,
             created: SystemTime::now(),
             indexed: None,
+            uploads: None,
         }
+    }
+
+    pub(crate) fn start_parallel_uploads(
+        &mut self,
+        connections: usize,
+        bytes: u64,
+    ) -> RusticResult<()> {
+        self.uploads = Some(IndexUploadPool::new(self.be.clone(), connections, bytes)?);
+        Ok(())
+    }
+
+    /// Join rebuild uploads before handing this indexer to the pack repackers.
+    pub(crate) fn finish_parallel_uploads(&mut self, flush: bool) -> RusticResult<()> {
+        if self.uploads.is_none() {
+            return Ok(());
+        }
+        let saved = if flush { self.save() } else { Ok(()) };
+        let uploads = self.uploads.take().expect("parallel index uploads enabled");
+        uploads.finalize()?;
+        saved?;
+        self.reset();
+        Ok(())
     }
 
     /// Resets the indexer.
@@ -113,7 +140,11 @@ impl<BE: DecryptWriteBackend> Indexer<BE> {
     /// * If the index file could not be serialized.
     pub fn save(&self) -> RusticResult<()> {
         if (self.file.packs.len() + self.file.packs_to_delete.len()) > 0 {
-            _ = self.be.save_file(&self.file)?;
+            if let Some(uploads) = &self.uploads {
+                uploads.save(&self.file)?;
+            } else {
+                _ = self.be.save_file(&self.file)?;
+            }
         }
         Ok(())
     }

@@ -184,6 +184,13 @@ impl ReadBackend for DelayedBackend {
         }
         let _active = self.metrics.enter(false);
         let request = self.metrics.gets.fetch_add(1, SeqCst) + 1;
+        if request == 1 {
+            assert_eq!(
+                self.metrics.index_active.load(SeqCst),
+                0,
+                "repacking started before index rebuild uploads finished"
+            );
+        }
         if self.metrics.fail_read_at.load(SeqCst) == request {
             return Err(RusticError::new(
                 ErrorKind::Backend,
@@ -600,6 +607,77 @@ fn upload_failure_preserves_old_packs_and_indexes_and_joins_workers() -> Result<
         repo.check(CheckOptions::default().read_data(true))?
             .is_ok()?;
     }
+    Ok(())
+}
+
+#[test]
+fn parallel_index_rebuild_respects_backend_limit_and_deletion_barrier() -> Result<()> {
+    let seed = seed_layout_bytes(16, 1, 64, 1024 * 1024, true)?;
+    let (_dir, repo, backend) = trial(&seed)?;
+    let m = &backend.metrics;
+    m.connection_limit.store(3, SeqCst);
+    let opts = opts(Some(10), false)
+        .instant_delete(false)
+        .max_repack("0".parse::<LimitOption>()?);
+    let plan = repo.prune_plan(&opts)?;
+    m.index_delay_ms.store(100, SeqCst);
+    m.enabled.store(true, SeqCst);
+    repo.prune(&opts, plan)?;
+    assert!(m.index_puts.load(SeqCst) >= 3);
+    assert!(m.index_peak.load(SeqCst) > 1);
+    assert!(m.index_peak.load(SeqCst) <= 3);
+    assert_eq!(m.index_active.load(SeqCst), 0);
+    assert!(m.deletes.load(SeqCst) > 0);
+    assert_eq!(m.puts.load(SeqCst), 0);
+    published_after_upload(&repo, m)?;
+    m.enabled.store(false, SeqCst);
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    Ok(())
+}
+
+#[test]
+fn index_upload_failure_preserves_old_indexes_and_packs_and_joins_workers() -> Result<()> {
+    let seed = seed_layout_bytes(16, 1, 64, 1024 * 1024, true)?;
+    let (_dir, repo, backend) = trial(&seed)?;
+    let m = &backend.metrics;
+    let old_packs: BTreeSet<_> = backend.list(FileType::Pack)?.into_iter().collect();
+    let old_indexes: BTreeSet<_> = backend.list(FileType::Index)?.into_iter().collect();
+    let opts = opts(Some(5), false)
+        .instant_delete(false)
+        .max_repack("0".parse::<LimitOption>()?);
+    let plan = repo.prune_plan(&opts)?;
+    m.index_delay_ms.store(100, SeqCst);
+    m.index_failures.store(2, SeqCst);
+    m.enabled.store(true, SeqCst);
+    let error = repo.prune(&opts, plan).unwrap_err();
+    assert!(
+        error.to_string().contains("injected index upload failure"),
+        "{error}"
+    );
+    let failures = 2 - m.index_failures.load(SeqCst);
+    assert_eq!(
+        error.context_value("index_upload_failures"),
+        Some(failures.to_string().as_str())
+    );
+    assert!(error.context_value("failed_index").is_some());
+    assert!(
+        error
+            .context_value("index_upload_errors")
+            .unwrap()
+            .contains("injected index upload failure")
+    );
+    assert_eq!(m.deletes.load(SeqCst), 0);
+    assert_eq!(m.puts.load(SeqCst), 0);
+    assert_eq!(m.index_active.load(SeqCst), 0);
+    assert!(old_indexes.is_subset(&backend.list(FileType::Index)?.into_iter().collect()));
+    assert!(old_packs.is_subset(&backend.list(FileType::Pack)?.into_iter().collect()));
+    let completed = m.index_puts.load(SeqCst);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(m.index_puts.load(SeqCst), completed);
+    m.enabled.store(false, SeqCst);
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
     Ok(())
 }
 

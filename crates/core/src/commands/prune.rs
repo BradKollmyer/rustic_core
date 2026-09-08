@@ -218,7 +218,7 @@ pub struct PruneOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub fast_repack: bool,
 
-    /// Use bounded parallel pack uploads. Uses the backend connection limit, or 5 if unset.
+    /// Use bounded parallel index and pack uploads. Uses the backend connection limit, or 5 if unset.
     #[cfg_attr(feature = "clap", clap(long))]
     pub parallel_repack: bool,
 
@@ -233,7 +233,8 @@ pub struct PruneOptions {
     )]
     pub repack_read_buffer: ByteSize,
 
-    /// Maximum pack bytes admitted to upload workers. Excludes the two pack builders and backend buffers.
+    /// Maximum admitted serialized index bytes during rebuild, or pack bytes during repack.
+    /// Excludes builders, one pending serialized index, and backend buffers.
     /// Allow roughly N times pack size, including header overhead, for N concurrent uploads.
     /// Smaller budgets reduce concurrency and may serialize uploads.
     #[cfg_attr(
@@ -1475,68 +1476,78 @@ pub(crate) fn prune_repository<S: Open>(
     let mut used_ids = prune_plan.used_ids;
     let mut repack_packs = Vec::new();
 
+    if let Some(connections) = connections {
+        indexer.start_parallel_uploads(connections, opts.repack_upload_buffer.as_u64())?;
+    }
+
     // process packs by index_file
     let p = repo.progress_counter("rebuilding index...");
     p.set_length(u64::try_from(prune_plan.index_files.len()).unwrap_or_default());
-    for index in prune_plan.index_files {
-        for mut pack in index.packs {
-            match pack.to_do {
-                PackToDo::Undecided => {
-                    return Err(RusticError::new(
-                        ErrorKind::Internal,
-                        "Pack `{pack_id}` got no decision what to do with it!",
-                    )
-                    .attach_context("pack_id", pack.id.to_string())
-                    .ask_report());
-                }
-                PackToDo::Keep => {
-                    // keep pack: add to new index; correct time if not set
-                    let pack = pack.into_index_pack(prune_time);
-                    indexer.add(pack)?;
-                }
-                PackToDo::Repack => {
-                    if opts.instant_delete {
-                        delete_pack(&pack);
-                    } else {
-                        // mark pack for removal
-                        let pack = pack.clone().into_index_pack_with_time(prune_time);
-                        indexer.add_remove(pack)?;
+    let rebuilt = (|| -> RusticResult<()> {
+        for index in prune_plan.index_files {
+            for mut pack in index.packs {
+                match pack.to_do {
+                    PackToDo::Undecided => {
+                        return Err(RusticError::new(
+                            ErrorKind::Internal,
+                            "Pack `{pack_id}` got no decision what to do with it!",
+                        )
+                        .attach_context("pack_id", pack.id.to_string())
+                        .ask_report());
                     }
-                    pack.blobs
-                        .retain(|blob| used_ids.remove(&UsedId(blob.id)).is_some()); // don't save duplicate blobs
-                    // sort blobs to later allow coalescing
-                    pack.blobs.sort_unstable();
-                    repack_packs.push(pack);
-                }
-                PackToDo::MarkDelete => {
-                    if opts.instant_delete {
-                        delete_pack(&pack);
-                    } else {
-                        // mark pack for removal
-                        let pack = pack.into_index_pack_with_time(prune_time);
-                        indexer.add_remove(pack)?;
-                    }
-                }
-                PackToDo::KeepMarked | PackToDo::KeepMarkedAndCorrect => {
-                    if opts.instant_delete {
-                        delete_pack(&pack);
-                    } else {
-                        // keep pack: add to new index; keep the timestamp.
-                        // Note the timestamp shouldn't be None here, however if it is not not set, use the current time to heal the entry!
+                    PackToDo::Keep => {
+                        // keep pack: add to new index; correct time if not set
                         let pack = pack.into_index_pack(prune_time);
-                        indexer.add_remove(pack)?;
+                        indexer.add(pack)?;
                     }
+                    PackToDo::Repack => {
+                        if opts.instant_delete {
+                            delete_pack(&pack);
+                        } else {
+                            // mark pack for removal
+                            let pack = pack.clone().into_index_pack_with_time(prune_time);
+                            indexer.add_remove(pack)?;
+                        }
+                        pack.blobs
+                            .retain(|blob| used_ids.remove(&UsedId(blob.id)).is_some()); // don't save duplicate blobs
+                        // sort blobs to later allow coalescing
+                        pack.blobs.sort_unstable();
+                        repack_packs.push(pack);
+                    }
+                    PackToDo::MarkDelete => {
+                        if opts.instant_delete {
+                            delete_pack(&pack);
+                        } else {
+                            // mark pack for removal
+                            let pack = pack.into_index_pack_with_time(prune_time);
+                            indexer.add_remove(pack)?;
+                        }
+                    }
+                    PackToDo::KeepMarked | PackToDo::KeepMarkedAndCorrect => {
+                        if opts.instant_delete {
+                            delete_pack(&pack);
+                        } else {
+                            // keep pack: add to new index; keep the timestamp.
+                            // Note the timestamp shouldn't be None here, however if it is not not set, use the current time to heal the entry!
+                            let pack = pack.into_index_pack(prune_time);
+                            indexer.add_remove(pack)?;
+                        }
+                    }
+                    PackToDo::Recover => {
+                        // recover pack: add to new index in section packs
+                        let pack = pack.into_index_pack_with_time(prune_time);
+                        indexer.add(pack)?;
+                    }
+                    PackToDo::Delete => delete_pack(&pack),
                 }
-                PackToDo::Recover => {
-                    // recover pack: add to new index in section packs
-                    let pack = pack.into_index_pack_with_time(prune_time);
-                    indexer.add(pack)?;
-                }
-                PackToDo::Delete => delete_pack(&pack),
             }
+            p.inc(1);
         }
-        p.inc(1);
-    }
+        Ok(())
+    })();
+    let uploaded = indexer.finish_parallel_uploads(rebuilt.is_ok());
+    uploaded?;
+    rebuilt?;
     p.finish();
 
     if repack_packs.is_empty() {

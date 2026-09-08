@@ -1,7 +1,7 @@
 # Bounded parallel repacking
 
-Parallel repacking is opt-in. It downloads and uploads packs under one I/O
-budget, while preserving the existing pack format, retention rules, and
+Parallel pruning is opt-in. It uploads rebuilt indexes concurrently, then
+downloads and uploads packs under one I/O budget, while preserving the existing pack format, retention rules, and
 upload-before-index ordering. It is currently enabled per prune invocation;
 ordinary backups and the default prune pipeline keep their existing uploader.
 
@@ -23,6 +23,15 @@ other repository clients retain their own limits. OpenDAL's existing limiter
 continues to apply to its backend operations.
 
 ## Scheduling and failure behavior
+
+Index rebuilding uses N upload workers and an unbuffered handoff. The producer
+serializes each completed index while workers compress, encrypt, verify, and
+upload previous indexes. It drains all rebuilt indexes, including the final
+partial index, before starting pack repacking. Any upload failure is returned
+with aggregated index-upload errors before the later old-index deletion phase.
+These workers are closed before the pack workers start, so their concurrency
+and byte limits do not add together. Default pruning and ordinary backups keep
+the existing synchronous index writer.
 
 N-1 download workers share one upload pool of N workers across tree and data
 packs. The completed-pack channel is unbuffered. A download worker keeps its
@@ -49,9 +58,10 @@ the old index after an interrupted repack is required.
 - `--repack-read-buffer` defaults to **128 MiB**. It bounds the sum of retained
   range-download buffers. Ranges are coalesced only while they fit this budget;
   permits are held until blob handoff finishes.
-- `--repack-upload-buffer` defaults to **256 MiB**. It bounds pack bodies detached
-  from the builders and admitted to upload workers, including bodies being
-  hashed, waiting for an I/O slot, uploading, or waiting for index publication.
+- `--repack-upload-buffer` defaults to **256 MiB**. During index rebuilding it
+  bounds serialized index bodies admitted to workers. During pack repacking it
+  bounds pack bodies detached from the builders, including bodies being hashed,
+  waiting for an I/O slot, uploading, or waiting for index publication.
 
 The two budgets are independent so uploads can complete when the download
 budget is full. Zero budgets are rejected. A single blob or completed pack
@@ -61,6 +71,10 @@ configured bytes; the budget is never silently exceeded.
 These are not total RSS limits. Two pack builders, decoded/compression buffers,
 indexes, allocator overhead, cache, and backend-private buffers use additional
 memory. A builder may hold a full pack while waiting for upload admission.
+During rebuilding, the producer can hold one serialized index waiting for byte
+admission in addition to the index builder. Worker compression/encryption and
+verification buffers are additional memory. An index larger than the upload
+budget is rejected before it is handed to a worker.
 
 Allow enough upload bytes for the intended concurrency **and pack overhead**.
 For example, two nominal 128 MiB packs may exceed 256 MiB after the final blob
