@@ -286,7 +286,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Cannot start prune pack upload worker")
+                .contains("Cannot start pack upload worker")
         );
         assert_eq!(finished.load(SeqCst), 2);
         assert!(budget.acquire().is_err());
