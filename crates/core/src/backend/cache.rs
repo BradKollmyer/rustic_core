@@ -26,15 +26,15 @@ mod constants {
     /// Tree walking reads many blobs from the same packs. Opening the cache
     /// file per blob was ~65% of prune CPU in a Time Profiler trace.
     pub(super) const OPEN_FILE_CAPACITY: usize = 2048;
-    /// Descriptors left for sockets, index files, and other I/O.
+    /// Minimum descriptors left for sockets, index files, and other I/O.
     pub(super) const OPEN_FILE_RESERVE: u64 = 64;
 }
 
 type OpenFileCache = quick_cache::sync::Cache<Id, Arc<CachedFile>>;
 
-/// Use up to [`constants::OPEN_FILE_CAPACITY`] cached pack FDs, leaving
-/// [`constants::OPEN_FILE_RESERVE`] for other I/O. `rlimit/8` mapped a Darwin
-/// 8192 soft limit to 1024 handles.
+/// Keep at most half the descriptor limit in the pack cache. Parallel index
+/// writes and pooled HTTP sockets outlive individual pack reads, so a fixed
+/// 64-descriptor reserve alone can exhaust a Linux 1024-descriptor limit.
 fn open_file_capacity() -> usize {
     #[cfg(unix)]
     if let Ok((soft, _)) =
@@ -47,7 +47,8 @@ fn open_file_capacity() -> usize {
 }
 
 fn open_file_capacity_from_soft_limit(soft: impl Into<u64>) -> usize {
-    usize::try_from(soft.into().saturating_sub(constants::OPEN_FILE_RESERVE))
+    let soft = soft.into();
+    usize::try_from((soft / 2).min(soft.saturating_sub(constants::OPEN_FILE_RESERVE)))
         .unwrap_or(usize::MAX)
         .clamp(1, constants::OPEN_FILE_CAPACITY)
 }
@@ -1007,9 +1008,12 @@ mod tests {
     }
 
     #[test]
-    fn open_file_capacity_uses_reserve_not_an_eighth() {
+    fn open_file_capacity_leaves_headroom_for_parallel_io() {
         assert_eq!(open_file_capacity_from_soft_limit(8192_u64), 2048);
-        assert_eq!(open_file_capacity_from_soft_limit(1024_u64), 960);
+        assert_eq!(open_file_capacity_from_soft_limit(4096_u64), 2048);
+        assert_eq!(open_file_capacity_from_soft_limit(1024_u64), 512);
+        assert_eq!(open_file_capacity_from_soft_limit(256_u64), 128);
+        assert_eq!(open_file_capacity_from_soft_limit(96_u64), 32);
         assert_eq!(open_file_capacity_from_soft_limit(64_u64), 1);
         assert_eq!(open_file_capacity_from_soft_limit(0_u64), 1);
     }
@@ -1041,9 +1045,10 @@ mod tests {
         }
 
         let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
-        setrlimit(Resource::RLIMIT_NOFILE, 64.min(hard), hard).unwrap();
+        let soft = 256.min(hard);
+        setrlimit(Resource::RLIMIT_NOFILE, soft, hard).unwrap();
         let (_dir, cache) = new_cache();
-        let ids: Vec<_> = (0..100).map(|_| Id::random()).collect();
+        let ids: Vec<_> = (0..300).map(|_| Id::random()).collect();
         for id in &ids {
             cache
                 .write_bytes(FileType::Pack, id, &vec![0_u8; 16].into())
@@ -1055,7 +1060,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             // Other backend/file operations must still have descriptor headroom.
-            let _other_files: Vec<_> = (0..16).map(|_| File::open("/dev/null").unwrap()).collect();
+            let _other_files: Vec<_> = (0..(soft / 4 + 16))
+                .map(|_| File::open("/dev/null").unwrap())
+                .collect();
         }
     }
 }
