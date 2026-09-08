@@ -109,11 +109,38 @@ impl UploadPool {
         n: usize,
         budget: &IoBudget,
         buffers: &RepackBuffers,
-    ) -> Self {
+    ) -> RusticResult<Self> {
+        Self::with_spawner(be, indexer, n, budget, buffers, |job| {
+            std::thread::Builder::new()
+                .name("prune-pack".into())
+                .spawn(job)
+        })
+    }
+
+    fn with_spawner<BE: DecryptWriteBackend>(
+        be: &BE,
+        indexer: &SharedIndexer<BE>,
+        n: usize,
+        budget: &IoBudget,
+        buffers: &RepackBuffers,
+        mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    ) -> RusticResult<Self> {
         let (tx, rx) = bounded::<Job>(0);
         let stopped = StopSignal::new();
         let errors = Arc::new(Mutex::new(Vec::new()));
-        let mut workers = Vec::new();
+        let mut pool = Self {
+            sender: Some(UploadSender {
+                tx,
+                stopped: stopped.clone(),
+                buffers: buffers.clone(),
+            }),
+            workers: Vec::new(),
+            stopped: stopped.clone(),
+            errors: errors.clone(),
+            budget: budget.clone(),
+            buffers: buffers.clone(),
+        };
+
         for _ in 0..n {
             let (rx, stopped, errors, budget, be, indexer) = (
                 rx.clone(),
@@ -124,7 +151,7 @@ impl UploadPool {
                 indexer.clone(),
             );
             let buffers = buffers.clone();
-            workers.push(std::thread::spawn(move || {
+            let worker = spawn(Box::new(move || {
                 loop {
                     let (file, index, cacheable, _bytes) = select_biased! {
                         recv(stopped.receiver) -> _ => break,
@@ -163,20 +190,17 @@ impl UploadPool {
                         buffers.cancel();
                     }
                 }
-            }));
+            }))
+            .map_err(|error| {
+                RusticError::with_source(
+                    ErrorKind::Internal,
+                    "Cannot start prune pack upload worker.",
+                    error,
+                )
+            })?;
+            pool.workers.push(worker);
         }
-        Self {
-            sender: Some(UploadSender {
-                tx,
-                stopped: stopped.clone(),
-                buffers: buffers.clone(),
-            }),
-            workers,
-            stopped,
-            errors,
-            budget: budget.clone(),
-            buffers: buffers.clone(),
-        }
+        Ok(pool)
     }
     pub(crate) fn sender(&self) -> UploadSender {
         self.sender
@@ -231,6 +255,42 @@ impl Drop for UploadPool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn spawn_failure_joins_previously_started_workers() {
+        use crate::{
+            backend::{MockBackend, decrypt::DecryptBackend},
+            crypto::aespoly1305::Key,
+            index::indexer::Indexer,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let be = DecryptBackend::new(Arc::new(MockBackend::new()), Key::new());
+        let indexer = Indexer::new_unindexed(be.clone()).into_shared();
+        let budget = IoBudget::new(5);
+        let buffers = RepackBuffers::new(10, 10);
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut calls = 0;
+        let error = UploadPool::with_spawner(&be, &indexer, 5, &budget, &buffers, |job| {
+            calls += 1;
+            if calls == 3 {
+                return Err(std::io::Error::other("injected thread creation failure"));
+            }
+            let finished = finished.clone();
+            std::thread::Builder::new().spawn(move || {
+                job();
+                finished.fetch_add(1, SeqCst);
+            })
+        })
+        .err()
+        .expect("third spawn must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot start prune pack upload worker")
+        );
+        assert_eq!(finished.load(SeqCst), 2);
+        assert!(budget.acquire().is_err());
+    }
 
     #[test]
     fn cancellation_rejects_reserved_upload_without_disconnecting_workers() {

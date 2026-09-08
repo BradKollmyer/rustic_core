@@ -1586,7 +1586,8 @@ pub(crate) fn prune_repository<S: Open>(
         let budget = connections.map(IoBudget::new);
         let uploads = budget
             .as_ref()
-            .map(|budget| UploadPool::new(be, &indexer, connections.unwrap(), budget, &buffers));
+            .map(|budget| UploadPool::new(be, &indexer, connections.unwrap(), budget, &buffers))
+            .transpose()?;
         let readers = connections
             .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n - 1).build())
             .transpose()
