@@ -1,7 +1,7 @@
 //! Opt-in prune upload pool. Pack bodies share one rendezvous queue and I/O budget.
 
 use super::{
-    byte_budget::{BytePermit, RepackBuffers},
+    byte_budget::{ByteBudget, BytePermit, RepackBuffers},
     packer::FileWriterHandle,
 };
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     index::indexer::SharedIndexer,
     repofile::{indexfile::IndexPack, packfile::PackId},
 };
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{RecvTimeoutError, Sender, bounded};
 use std::{
     sync::{
         Arc, Mutex,
@@ -22,27 +22,16 @@ use std::{
 };
 
 #[derive(Clone)]
-pub(crate) struct IoBudget {
-    tx: Sender<()>,
-    rx: Receiver<()>,
-}
+pub(crate) struct IoBudget(ByteBudget);
 impl IoBudget {
     pub(crate) fn new(n: usize) -> Self {
-        let (tx, rx) = bounded(n);
-        for _ in 0..n {
-            tx.send(()).unwrap();
-        }
-        Self { tx, rx }
+        Self(ByteBudget::new(n as u64, "--repack-connections"))
     }
-    pub(crate) fn acquire(&self) -> IoPermit<'_> {
-        self.rx.recv().unwrap();
-        IoPermit(self)
+    pub(crate) fn acquire(&self) -> RusticResult<BytePermit> {
+        self.0.acquire(1)
     }
-}
-pub(crate) struct IoPermit<'a>(&'a IoBudget);
-impl Drop for IoPermit<'_> {
-    fn drop(&mut self) {
-        self.0.tx.send(()).unwrap();
+    fn cancel(&self) {
+        self.0.cancel();
     }
 }
 
@@ -82,6 +71,7 @@ pub(crate) struct UploadPool {
     workers: Vec<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<RusticError>>>,
+    budget: IoBudget,
     buffers: RepackBuffers,
 }
 impl UploadPool {
@@ -120,7 +110,9 @@ impl UploadPool {
                     let id = PackId::from(
                         hash_reader(file.clone().reader()).expect("reading memory cannot fail"),
                     );
-                    let _permit = budget.acquire();
+                    let Ok(_permit) = budget.acquire() else {
+                        break;
+                    };
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -138,6 +130,7 @@ impl UploadPool {
                             .unwrap()
                             .push(*error.attach_context("pack_id", id.to_string()));
                         stopped.store(true, Ordering::Release);
+                        budget.cancel();
                         buffers.cancel();
                     }
                 }
@@ -152,6 +145,7 @@ impl UploadPool {
             workers,
             stopped,
             errors,
+            budget: budget.clone(),
             buffers: buffers.clone(),
         }
     }
@@ -195,7 +189,31 @@ impl UploadPool {
 impl Drop for UploadPool {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        self.budget.cancel();
         self.buffers.cancel();
         self.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_wakes_io_waiter_without_releasing_active_permit() {
+        let budget = IoBudget::new(1);
+        let active = budget.acquire().unwrap();
+        let other = budget.clone();
+        let (done_tx, done_rx) = bounded(0);
+        let waiter = std::thread::spawn(move || {
+            let _ = done_tx.send(other.acquire().is_err());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        budget.cancel();
+        let cancelled = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(active);
+        assert!(cancelled.unwrap());
+        waiter.join().unwrap();
+        assert!(budget.acquire().is_err());
     }
 }

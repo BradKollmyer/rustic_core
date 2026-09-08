@@ -49,7 +49,7 @@ impl ByteBudget {
         if state.cancelled {
             return Err(RusticError::new(
                 ErrorKind::Backend,
-                "Repack buffer wait cancelled after a failure.",
+                "Repack resource wait cancelled after a failure.",
             ));
         }
         state.used += bytes;

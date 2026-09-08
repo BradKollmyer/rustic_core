@@ -1030,7 +1030,11 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
             .as_ref()
             .map(|(_, bytes)| bytes.acquire(u64::from(pack_blobs.locations.length)))
             .transpose()?;
-        let permit = self.budget.as_ref().map(|(io, _)| io.acquire());
+        let permit = self
+            .budget
+            .as_ref()
+            .map(|(io, _)| io.acquire())
+            .transpose()?;
         let data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,
@@ -1084,7 +1088,11 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
             .as_ref()
             .map(|(_, bytes)| bytes.acquire(u64::from(pack_blobs.locations.length)))
             .transpose()?;
-        let permit = self.budget.as_ref().map(|(io, _)| io.acquire());
+        let permit = self
+            .budget
+            .as_ref()
+            .map(|(io, _)| io.acquire())
+            .transpose()?;
         let read_data = self.be_src.read_partial(
             FileType::Pack,
             &pack_blobs.pack_id,
