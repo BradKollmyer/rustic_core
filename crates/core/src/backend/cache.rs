@@ -826,21 +826,22 @@ impl Cache {
     ///
     /// * If the file could not be removed.
     pub fn remove(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
-        trace!("cache writing tpe: {tpe:?}, id: {id}");
+        trace!("cache removing tpe: {tpe:?}, id: {id}");
         _ = self.open_files.remove(id);
         let filename = self.path(tpe, id);
-        fs::remove_file(&filename).map_err(|err| {
-            RusticError::with_source(
+        match fs::remove_file(&filename) {
+            Ok(()) => Ok(()),
+            // Cache entries are optional and may already have been evicted.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(RusticError::with_source(
                 ErrorKind::InputOutput,
                 "Failed to remove file at `{path}`",
                 err,
             )
             .attach_context("path", filename.display().to_string())
             .attach_context("tpe", tpe.to_string())
-            .attach_context("id", id.to_string())
-        })?;
-
-        Ok(())
+            .attach_context("id", id.to_string())),
+        }
     }
 }
 
@@ -973,6 +974,35 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.open_files.len(), 0);
+        cache.remove(FileType::Pack, &id).unwrap();
+    }
+
+    #[test]
+    fn removing_absent_cache_entries_succeeds_and_invalidates_open_files() {
+        let (_dir, cache) = new_cache();
+        let id = Id::random();
+        cache.remove(FileType::Pack, &id).unwrap();
+        cache
+            .write_bytes(FileType::Pack, &id, &vec![1_u8; 16].into())
+            .unwrap();
+        _ = cache.read_partial(FileType::Pack, &id, 0, 4).unwrap();
+        assert_eq!(cache.open_files.len(), 1);
+        fs::remove_file(cache.path(FileType::Pack, &id)).unwrap();
+
+        cache.remove(FileType::Pack, &id).unwrap();
+        assert_eq!(cache.open_files.len(), 0);
+        assert!(cache.read_full(FileType::Pack, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_removal_preserves_other_filesystem_errors() {
+        let (_dir, cache) = new_cache();
+        let id = Id::random();
+        let path = cache.path(FileType::Pack, &id);
+        fs::create_dir_all(&path).unwrap();
+
+        assert!(cache.remove(FileType::Pack, &id).is_err());
+        assert!(path.is_dir());
     }
 
     #[test]
