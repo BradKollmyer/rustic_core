@@ -132,3 +132,50 @@ The final local validation also passed 196 core unit tests (including CLI
 parsing and weighted-budget tests), 8 pipeline integration tests, and 24
 existing prune cases. The rustic CLI compiles. Clippy passed with the
 preexisting unrelated cache `manual_clamp` lint excluded.
+
+## Isolated B2 validation on Arc
+
+The x86_64 Linux release CLI was built on Darwin with Apple Container and
+Rosetta, targeting `x86_64-unknown-linux-musl`. The candidate includes core
+commit `9ecd69e`; the frozen installed baseline identifies core `ca66cd1`.
+Both include the same Storj revision `f4e5374`.
+
+The fixture started with 1 GiB of random data in 1 MiB files, an 8 MiB target
+data-pack size, grow factor 0, and compression level 1. After deleting alternate
+files, a second backup and local forget left 512 MiB live. Three identical
+copies were uploaded under a unique disposable B2 prefix before any remote
+prune. Every invocation verified the test repository ID before mutation.
+
+All three runs used OpenDAL's native B2 backend with `connections=10`, separate
+caches, `--max-repack 1GiB --max-unused 0 --keep-delete 100y`, and normal
+repacking. Candidate runs added `--repack-connections 5` or `10` and a 1 GiB
+upload budget; the read budget remained 128 MiB. Metadata checks ran before
+each prune and full `check --read-data` checks followed it. Process RSS was
+sampled every 100 ms. These are single trials per setting, not repeated or
+randomized measurements, and the small packs differ from the fleet repository.
+
+| Pipeline | Whole prune seconds | Repack seconds | Sampled peak RSS MiB |
+|---|---:|---:|---:|
+| Installed baseline | 61.30 | 57.39 | 1026 |
+| Parallel N=5 | 27.30 | 23.20 | 691 |
+| Parallel N=10 | 16.00 | 12.17 | 848 |
+
+Each run repacked 512 MiB of live blobs from the same 122 source packs and
+passed the full data check. Whole-prune elapsed time improved by 2.25x at N=5
+and 3.83x at N=10 in this trial. Integrity-check time is excluded from the
+timings. RSS includes the CLI and backend, not just the explicit byte budgets.
+The baseline comparison includes all pipeline changes, including bounded
+reads; it does not isolate uploader parallelism alone. This demonstrates a
+benefit on this B2 fixture, not a forecast for the fleet's larger packs.
+
+After validation, all objects and old versions under the disposable B2 prefix
+were removed and an empty version-inclusive listing was verified. The Arc
+trial directory, including its ephemeral password and caches, was removed.
+Arc's installed binary was unchanged, and its prune service remained inactive
+with the timer disabled. The shared fleet repository received only a dry-run
+preview; no retention or pack mutations were applied to it.
+
+Build provenance, raw logs, measured results, and cleanup evidence are retained
+locally under the sibling CLI repository's
+`dist/arc-parallel-prune-20260907/` directory. The release artifact SHA-256 is
+`d96e720d39658b8524c46e519a130bbf1a858944b29f990364b3c051933fb83f`.
