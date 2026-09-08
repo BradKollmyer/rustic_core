@@ -465,6 +465,7 @@ fn backend_limits_reach_prune_through_cache_and_cap_overrides() -> Result<()> {
         .open(&Credentials::Masterkey(seed.key.clone()))?;
         let m = &backend.metrics;
         m.connection_limit.store(backend_limit, SeqCst);
+        assert!(backend.tree_loader_count() <= backend_limit);
         let opts = opts(requested, true).parallel_repack(true);
         let plan = repo.prune_plan(&opts)?;
         m.read_ms.store(15, SeqCst);

@@ -180,11 +180,14 @@ impl ReadBackend for CachedBackend {
         // Warm pack cache: local preads. 2×CPUs loaders oversubscribe QEMU
         // vCPUs (KVM PV spinlocks + musl malloc). Cold cache: keep extra
         // loaders for B2 RTTs.
-        if self.cache.has_cached_packs() {
+        let desired = if self.cache.has_cached_packs() {
             rayon::current_num_threads().clamp(4, 8)
         } else {
             self.be.tree_loader_count()
-        }
+        };
+        self.be
+            .connection_limit()
+            .map_or(desired, |limit| desired.min(limit.max(1)))
     }
 
     /// Lists all files with their size of the given type.
@@ -849,6 +852,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(RepositoryId::default(), Some(dir.path().to_path_buf())).unwrap();
         (dir, cache)
+    }
+
+    struct LimitedBackend;
+    impl ReadBackend for LimitedBackend {
+        fn location(&self) -> String {
+            "limited test backend".into()
+        }
+        fn warmup_path(&self, _: FileType, _: &Id) -> String {
+            unreachable!()
+        }
+        fn connection_limit(&self) -> Option<usize> {
+            Some(2)
+        }
+        fn tree_loader_count(&self) -> usize {
+            16
+        }
+        fn list_with_size(&self, _: FileType) -> RusticResult<Vec<(Id, u32)>> {
+            unreachable!()
+        }
+        fn read_full(&self, _: FileType, _: &Id) -> RusticResult<Bytes> {
+            unreachable!()
+        }
+        fn read_partial(
+            &self,
+            _: FileType,
+            _: &Id,
+            _: bool,
+            _: u32,
+            _: u32,
+        ) -> RusticResult<Bytes> {
+            unreachable!()
+        }
+    }
+    impl WriteBackend for LimitedBackend {
+        fn write_bytes(&self, _: FileType, _: &Id, _: bool, _: BytesList) -> RusticResult<()> {
+            unreachable!()
+        }
+        fn remove(&self, _: FileType, _: &Id, _: bool) -> RusticResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn tree_loaders_respect_connection_limit_with_cold_and_warm_cache() {
+        for warm in [false, true] {
+            let (_dir, cache) = new_cache();
+            if warm {
+                cache
+                    .write_bytes(FileType::Pack, &Id::random(), &vec![1_u8; 10].into())
+                    .unwrap();
+            }
+            let cached = CachedBackend::new_cache(Arc::new(LimitedBackend), cache);
+            assert_eq!(cached.tree_loader_count(), 2);
+        }
     }
 
     #[test]

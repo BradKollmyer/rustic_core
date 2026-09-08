@@ -125,8 +125,11 @@ pub trait ReadBackend: Send + Sync + 'static {
     ///
     /// Remote backends use `2 × CPUs` (8–32) so prune is not RTT-bound on B2.
     /// Cached backends use fewer when pack files are already on disk.
+    /// An advertised backend connection limit caps the worker count.
     fn tree_loader_count(&self) -> usize {
-        current_num_threads().saturating_mul(2).clamp(8, 32)
+        let desired = current_num_threads().saturating_mul(2).clamp(8, 32);
+        self.connection_limit()
+            .map_or(desired, |limit| desired.min(limit.max(1)))
     }
 
     /// Lists all files of the given type.
