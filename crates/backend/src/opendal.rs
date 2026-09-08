@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, ffi::OsStr, str::FromStr, sync::Arc, vec::IntoI
 
 use bytes::Bytes;
 use bytesize::ByteSize;
-use log::{error, trace, warn};
+use log::{debug, error, trace, warn};
 use opendal::{
     Entry, HttpTransporter, Metadata, OperationContext,
     blocking::{Operator, StdReader},
@@ -45,24 +45,55 @@ pub struct OpenDALBackend {
     connections: Option<usize>,
 }
 
-/// Log `OpenDAL` retries as a single line using `Display`, not `Debug`.
-///
-/// `OpenDAL`'s default interceptor formats the error with `{:?}`, which dumps
-/// the full context/source tree across many lines and fights progress/TUI
-/// output.
-#[derive(Clone, Copy, Debug)]
-struct CompactRetryInterceptor;
+/// Keep retry warnings brief; preserve the complete error chain at debug level.
+#[derive(Clone, Debug)]
+struct CompactRetryInterceptor {
+    service: String,
+}
 
 impl RetryInterceptor for CompactRetryInterceptor {
     fn intercept(&self, event: RetryEvent<'_>) {
         warn!(
-            "Error {err} at {duration:?}, retrying {op:?} (attempt {attempt})",
-            err = event.err,
-            duration = event.retry_after,
+            "{service} {op} failed temporarily; retry {attempt} in {delay:.2}s: {cause}",
+            service = self.service,
             op = event.op,
             attempt = event.attempt,
+            delay = event.retry_after.as_secs_f64(),
+            cause = retry_cause(event.err),
+        );
+        debug!(
+            "{service} {op} retry {attempt} details: {err:?}",
+            service = self.service,
+            op = event.op,
+            attempt = event.attempt,
+            err = event.err,
         );
     }
+}
+
+fn retry_cause(err: &opendal::Error) -> String {
+    use std::error::Error;
+
+    let mut source = err.source();
+    let mut root = None;
+    while let Some(cause) = source {
+        root = Some(cause);
+        source = cause.source();
+    }
+    let message = root.map_or_else(|| err.message().to_owned(), ToString::to_string);
+    // Source messages can contain request URLs or multiline server responses too.
+    let summary = message
+        .split_whitespace()
+        .map(|word| if word.contains("://") { "[URL]" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if summary.is_empty() {
+        return err.kind().to_string();
+    }
+    if summary.chars().count() > 200 {
+        return summary.chars().take(200).chain(['…']).collect();
+    }
+    summary
 }
 
 /// Throttling parameters
@@ -193,7 +224,9 @@ impl OpenDALBackend {
                 RetryLayer::new()
                     .with_max_times(max_retries)
                     .with_jitter()
-                    .with_notify(CompactRetryInterceptor),
+                    .with_notify(CompactRetryInterceptor {
+                        service: scheme.to_ascii_uppercase(),
+                    }),
             );
 
         if let Some(Throttle { bandwidth, burst }) = throttle {
@@ -631,6 +664,48 @@ mod tests {
     use rstest::rstest;
     use serde::Deserialize;
     use std::{fs, path::PathBuf};
+
+    #[test]
+    fn retry_cause_uses_underlying_error_without_request_context() {
+        #[derive(Debug)]
+        struct RequestFailure(std::io::Error);
+        impl std::fmt::Display for RequestFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "request failed for https://example.invalid/upload/token")
+            }
+        }
+        impl std::error::Error for RequestFailure {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err = opendal::Error::new(opendal::ErrorKind::Unexpected, "send http request")
+            .with_context("url", "https://example.invalid/upload/token")
+            .with_context("path", "index/pack-id")
+            .set_source(RequestFailure(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            )))
+            .set_temporary();
+        assert_eq!(retry_cause(&err), "connection reset");
+        assert!(format!("{err:?}").contains("https://example.invalid/upload/token"));
+        assert!(err.is_temporary());
+    }
+
+    #[test]
+    fn retry_cause_sanitizes_source_messages_and_bounds_server_responses() {
+        let err = opendal::Error::new(opendal::ErrorKind::Unexpected, "send http request")
+            .set_source(std::io::Error::other(
+                "request to https://example.invalid/upload/token\nfailed",
+            ));
+        assert_eq!(retry_cause(&err), "request to [URL] failed");
+        let err = opendal::Error::new(opendal::ErrorKind::Unexpected, "é".repeat(300));
+        let summary = retry_cause(&err);
+        assert_eq!(summary.chars().count(), 201);
+        assert!(summary.ends_with('…'));
+        let empty = opendal::Error::new(opendal::ErrorKind::Unexpected, " \n");
+        assert_eq!(retry_cause(&empty), "Unexpected");
+    }
 
     #[rstest]
     #[case("10kB,10MB", Throttle{bandwidth:10_000, burst:10_000_000})]
