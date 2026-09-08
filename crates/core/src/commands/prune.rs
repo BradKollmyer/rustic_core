@@ -234,6 +234,8 @@ pub struct PruneOptions {
     pub repack_read_buffer: ByteSize,
 
     /// Maximum pack bytes admitted to upload workers. Excludes the two pack builders and backend buffers.
+    /// Allow roughly N times pack size, including header overhead, for N concurrent uploads.
+    /// Smaller budgets reduce concurrency and may serialize uploads.
     #[cfg_attr(
         feature = "clap",
         clap(long, value_name = "SIZE", default_value = "256MiB")
