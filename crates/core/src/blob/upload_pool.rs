@@ -278,7 +278,7 @@ mod tests {
             let finished = finished.clone();
             std::thread::Builder::new().spawn(move || {
                 job();
-                finished.fetch_add(1, SeqCst);
+                _ = finished.fetch_add(1, SeqCst);
             })
         })
         .err()
