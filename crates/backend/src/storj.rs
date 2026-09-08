@@ -269,10 +269,9 @@ fn parse_retry(options: &BTreeMap<String, String>) -> RusticResult<ExponentialBu
 }
 
 fn is_retryable(err: &storj::Error) -> bool {
-    matches!(
-        err.kind(),
-        storj::ErrorKind::TooManyRequests | storj::ErrorKind::Protocol | storj::ErrorKind::Io
-    )
+    // Protocol also covers permanent range validation failures. Preserve the
+    // SDK's per-cause decision, including aggregated piece download failures.
+    err.is_retryable()
 }
 
 fn map_storj_error(err: storj::Error) -> Box<RusticError> {
