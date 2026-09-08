@@ -14,6 +14,7 @@ thread_local! {
     };
 }
 
+#[derive(Default)]
 struct ZstdTls {
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
     buf: Vec<u8>,
@@ -43,8 +44,11 @@ fn zstd_tls_decompressor(
 /// every blob and showed up as `ZSTD_createDCtx` / `munmap` / page faults.
 fn zstd_decompress(data: &[u8], uncompressed_len: usize) -> RusticResult<Vec<u8>> {
     ZSTD.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        zstd_tls_decompressor(&mut slot)?
+        // A plaintext callback may recursively decompress on this thread.
+        let mut fallback = ZstdTls::default();
+        let mut borrowed = slot.try_borrow_mut().ok();
+        let slot = borrowed.as_deref_mut().unwrap_or(&mut fallback);
+        zstd_tls_decompressor(slot)?
             .decompress(data, uncompressed_len)
             .map_err(|err| {
                 RusticError::with_source(
@@ -67,8 +71,11 @@ fn zstd_decompress_with<R>(
     f: impl FnOnce(&[u8]) -> RusticResult<R>,
 ) -> RusticResult<R> {
     ZSTD.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let ZstdTls { decompressor, buf } = &mut *slot;
+        // A plaintext callback may recursively decompress on this thread.
+        let mut fallback = ZstdTls::default();
+        let mut borrowed = slot.try_borrow_mut().ok();
+        let slot = borrowed.as_deref_mut().unwrap_or(&mut fallback);
+        let ZstdTls { decompressor, buf } = slot;
         if decompressor.is_none() {
             *decompressor = Some(zstd::bulk::Decompressor::new().map_err(|err| {
                 RusticError::with_source(
@@ -831,6 +838,23 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+
+    #[test]
+    fn plaintext_callback_can_decompress_recursively() -> Result<()> {
+        let outer = zstd::bulk::compress(b"outer", 1)?;
+        let inner = zstd::bulk::compress(b"inner", 1)?;
+        zstd_decompress_with(&outer, 5, |plain| {
+            assert_eq!(plain, b"outer");
+            assert_eq!(zstd_decompress(&inner, 5)?, b"inner");
+            zstd_decompress_with(&inner, 5, |nested| {
+                assert_eq!(nested, b"inner");
+                assert_eq!(plain, b"outer");
+                Ok(())
+            })
+        })?;
+        assert_eq!(zstd_decompress(&outer, 5)?, b"outer");
+        Ok(())
+    }
 
     fn init() -> (DecryptBackend<Key>, &'static [u8]) {
         let be = Arc::new(MockBackend::new());
