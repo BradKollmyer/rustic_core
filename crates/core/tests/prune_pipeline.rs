@@ -49,6 +49,8 @@ struct Metrics {
     write_mib_per_second: AtomicU64,
     failures: AtomicUsize,
     fail_read_at: AtomicUsize,
+    data_writes: AtomicUsize,
+    peak_data_writes: AtomicUsize,
     index_puts: AtomicUsize,
     index_active: AtomicUsize,
     index_peak: AtomicUsize,
@@ -66,6 +68,20 @@ struct Metrics {
     wake: Condvar,
     completed: Mutex<BTreeSet<Id>>,
     published: Mutex<Vec<(Id, BTreeSet<Id>)>>,
+}
+struct DataWrite<'a>(&'a Metrics);
+impl<'a> DataWrite<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        metrics
+            .peak_data_writes
+            .fetch_max(metrics.data_writes.fetch_add(1, SeqCst) + 1, SeqCst);
+        Self(metrics)
+    }
+}
+impl Drop for DataWrite<'_> {
+    fn drop(&mut self) {
+        self.0.data_writes.fetch_sub(1, SeqCst);
+    }
 }
 struct IndexActive<'a>(&'a Metrics);
 impl Drop for IndexActive<'_> {
@@ -235,6 +251,7 @@ impl WriteBackend for DelayedBackend {
         }
         if t == FileType::Pack {
             let _active = self.metrics.enter(true);
+            let _data = (!c).then(|| DataWrite::new(&self.metrics));
             let _hold = HeldBytes::new(&self.metrics, data.size() as u64, true);
             self.metrics.puts.fetch_add(1, SeqCst);
             self.metrics.write_bytes.fetch_add(
@@ -1063,14 +1080,7 @@ impl log::Log for BenchmarkLogger {
     fn flush(&self) {}
 }
 
-/// Explicit opt-in only: the runner seeds and cleans this dedicated S3 prefix.
-#[test]
-#[ignore = "requires a disposable Ceph S3 fixture; use scripts/benchmark-prune-s3.py"]
-#[allow(clippy::cast_precision_loss)]
-fn benchmark_prune_s3() -> Result<()> {
-    static LOGGER: BenchmarkLogger = BenchmarkLogger;
-    log::set_logger(&LOGGER)?;
-    log::set_max_level(log::LevelFilter::Warn);
+fn benchmark_s3_backend(connections: Option<usize>) -> Result<DelayedBackend> {
     let root = std::env::var("PRUNE_S3_ROOT")?;
     let bucket = std::env::var("CEPH_FURIES_S3_BUCKET")?;
     anyhow::ensure!(bucket == "rustic-prune-bench" && root.starts_with("bench-"));
@@ -1090,10 +1100,29 @@ fn benchmark_prune_s3() -> Result<()> {
     ]);
     // Explicit credentials only; never fall back to a host instance role.
     options.insert("disable_ec2_metadata".into(), "true".into());
+    if let Some(n) = connections {
+        options.insert("connections".into(), n.to_string());
+    }
     let backend = DelayedBackend {
         inner: Arc::new(rustic_backend::OpenDALBackend::new("s3", options)?),
         metrics: Arc::new(Metrics::default()),
     };
+    backend
+        .metrics
+        .connection_limit
+        .store(connections.unwrap_or(0), SeqCst);
+    Ok(backend)
+}
+
+/// Explicit opt-in only: the runner seeds and cleans this dedicated S3 prefix.
+#[test]
+#[ignore = "requires a disposable Ceph S3 fixture; use scripts/benchmark-prune-s3.py"]
+#[allow(clippy::cast_precision_loss)]
+fn benchmark_prune_s3() -> Result<()> {
+    static LOGGER: BenchmarkLogger = BenchmarkLogger;
+    log::set_logger(&LOGGER)?;
+    log::set_max_level(log::LevelFilter::Warn);
+    let backend = benchmark_s3_backend(None)?;
     *backend.metrics.completed.lock().unwrap() =
         backend.list(FileType::Pack)?.into_iter().collect();
     let key: MasterKey = serde_json::from_slice(&fs::read(std::env::var("PRUNE_S3_KEY_FILE")?)?)?;
@@ -1133,5 +1162,142 @@ fn benchmark_prune_s3() -> Result<()> {
     repo.check(CheckOptions::default().read_data(true))?
         .is_ok()?;
     println!("CHECK passed");
+    Ok(())
+}
+
+fn backup_benchmark_file(path: &Path, bytes: usize, random: &mut u64) -> Result<()> {
+    let mut data = vec![0_u8; bytes];
+    for block in data.chunks_exact_mut(8) {
+        *random ^= *random << 13;
+        *random ^= *random >> 7;
+        *random ^= *random << 17;
+        block.copy_from_slice(&random.to_le_bytes());
+    }
+    fs::write(path, data)?;
+    Ok(())
+}
+
+fn verify_s3_backup(
+    repo: Repository<OpenStatus>,
+    snapshot: &SnapshotFile,
+    source: &Path,
+    file_count: u64,
+) -> Result<()> {
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_and_path(snapshot, "source")?;
+    let ls_options = rustic_core::LsOptions::default();
+    let ls = repo.ls(&node, &ls_options)?;
+    let restored = tempdir()?;
+    let destination =
+        rustic_core::LocalDestination::new(restored.path().to_str().unwrap(), true, false)?;
+    let restore_options = rustic_core::RestoreOptions::default();
+    let plan = repo.prepare_restore(&restore_options, ls.clone(), &destination, false)?;
+    repo.restore(plan, &restore_options, ls, &destination)?;
+    assert_eq!(fs::read_dir(restored.path())?.count() as u64, file_count);
+    for file in 0..file_count {
+        let name = format!("{file:06}");
+        assert!(
+            fs::read(source.join(&name))? == fs::read(restored.path().join(&name))?,
+            "restored bytes differ for {name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an empty disposable S3 prefix; use scripts/benchmark-backup-s3.py"]
+#[allow(clippy::cast_precision_loss)]
+fn benchmark_backup_s3() -> Result<()> {
+    static LOGGER: BenchmarkLogger = BenchmarkLogger;
+    log::set_logger(&LOGGER)?;
+    log::set_max_level(log::LevelFilter::Warn);
+    let scratch = tempdir()?;
+    let source = scratch.path().join("source");
+    fs::create_dir(&source)?;
+    let size_mib = benchmark_value("BACKUP_S3_MIB", 4096);
+    anyhow::ensure!(size_mib >= 64 && size_mib.is_multiple_of(64));
+    let file_count = size_mib / 16;
+    let mut random = 0x0123_4567_89ab_cdef_u64;
+    for file in 0..file_count {
+        backup_benchmark_file(
+            &source.join(format!("{file:06}")),
+            16 * 1024 * 1024,
+            &mut random,
+        )?;
+    }
+    let key = MasterKey::new();
+    let cache = tempdir()?;
+    let options = RepositoryOptions::default().cache_dir(cache.path());
+    let config = ConfigOptions::default()
+        .set_datapack_size(ByteSize::mib(128))
+        .set_datapack_growfactor(0)
+        .set_treepack_growfactor(0)
+        .set_compression(1);
+    let backend = benchmark_s3_backend(Some(5))?;
+    anyhow::ensure!(backend.list(FileType::Pack)?.is_empty());
+    let backends = RepositoryBackends::new(Arc::new(backend), None);
+    Repository::new(&options, &backends)?.init(
+        &Credentials::Masterkey(key.clone()),
+        &KeyOptions::default(),
+        &config,
+    )?;
+    let paths = PathList::from_iter([source.clone()]);
+    let backup_options = BackupOptions::default().as_path(Path::new("source").to_path_buf());
+    for stage in ["initial", "unchanged", "changed"] {
+        if stage == "changed" {
+            for file in (0..file_count).step_by(4) {
+                backup_benchmark_file(
+                    &source.join(format!("{file:06}")),
+                    16 * 1024 * 1024,
+                    &mut random,
+                )?;
+            }
+        }
+        let backend = benchmark_s3_backend(Some(5))?;
+        let m = &backend.metrics;
+        *m.completed.lock().unwrap() = backend.list(FileType::Pack)?.into_iter().collect();
+        let backends = RepositoryBackends::new(Arc::new(backend.clone()), None);
+        let repo =
+            Repository::new(&options, &backends)?.open(&Credentials::Masterkey(key.clone()))?;
+        m.enabled.store(true, SeqCst);
+        println!("BEGIN backup-{stage}");
+        let start = Instant::now();
+        let repo = repo.to_indexed_ids()?;
+        let snapshot = repo.backup(&backup_options, &paths, SnapshotFile::default())?;
+        let seconds = start.elapsed().as_secs_f64();
+        m.enabled.store(false, SeqCst);
+        let summary = snapshot.summary.as_ref().expect("backup has a summary");
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.total_files_processed, file_count);
+        if stage == "unchanged" {
+            assert_eq!(summary.files_unmodified, file_count);
+            assert_eq!(summary.data_added_files, 0);
+            assert_eq!(summary.data_blobs, 0);
+        } else if stage == "changed" {
+            assert_eq!(summary.files_changed, file_count / 4);
+            assert_eq!(summary.files_unmodified, 3 * file_count / 4);
+            assert_eq!(summary.data_added_files, size_mib * 1024 * 1024 / 4);
+        }
+        println!(
+            "RESULT {}",
+            serde_json::json!({
+                "stage": stage, "seconds": seconds, "source_mib": size_mib,
+                "files_new": summary.files_new, "files_changed": summary.files_changed,
+                "files_unmodified": summary.files_unmodified,
+                "data_added_mib": summary.data_added_files as f64 / 1_048_576.,
+                "pack_write_mib": m.write_bytes.load(SeqCst) as f64 / 1_048_576.,
+                "peak_put": m.peak_writes.load(SeqCst),
+                "peak_data_put": m.peak_data_writes.load(SeqCst),
+                "pack_puts": m.puts.load(SeqCst), "index_puts": m.index_puts.load(SeqCst),
+                "error_count": summary.error_count,
+            })
+        );
+        let repo = repo.drop_index();
+        published_after_upload(&repo, m)?;
+        verify_s3_backup(repo, &snapshot, &source, file_count)?;
+        println!("CHECK {stage} passed (full repository check and byte-for-byte restore)");
+    }
     Ok(())
 }
