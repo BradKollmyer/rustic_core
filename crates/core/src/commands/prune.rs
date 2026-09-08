@@ -1535,6 +1535,7 @@ pub(crate) fn prune_repository<S: Open>(
                 PackToDo::Delete => delete_pack(&pack),
             }
         }
+        p.inc(1);
     }
     p.finish();
 
