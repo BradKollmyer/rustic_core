@@ -952,10 +952,10 @@ mod tests {
 
     #[test]
     fn open_file_capacity_uses_reserve_not_an_eighth() {
-        assert_eq!(open_file_capacity_from_soft_limit(8192), 2048);
-        assert_eq!(open_file_capacity_from_soft_limit(1024), 960);
-        assert_eq!(open_file_capacity_from_soft_limit(64), 1);
-        assert_eq!(open_file_capacity_from_soft_limit(0), 1);
+        assert_eq!(open_file_capacity_from_soft_limit(8192_u64), 2048);
+        assert_eq!(open_file_capacity_from_soft_limit(1024_u64), 960);
+        assert_eq!(open_file_capacity_from_soft_limit(64_u64), 1);
+        assert_eq!(open_file_capacity_from_soft_limit(0_u64), 1);
     }
 
     #[cfg(unix)]
