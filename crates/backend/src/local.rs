@@ -1,7 +1,7 @@
 use std::{
     fmt::Debug,
     fs::{self, File, Metadata},
-    io::{Read, Seek, SeekFrom},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -472,11 +472,7 @@ impl WriteBackend for LocalBackend {
         _cacheable: bool,
         content: BytesList,
     ) -> RusticResult<()> {
-        fn write_local_file(
-            filename: &Path,
-            mut reader: impl Read,
-            length: u64,
-        ) -> RusticResult<()> {
+        fn write_local_file(filename: &Path, content: &BytesList, length: u64) -> RusticResult<()> {
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -501,7 +497,16 @@ impl WriteBackend for LocalBackend {
                     .attach_context("path", filename.to_string_lossy())
             })?;
 
-            _ = std::io::copy(&mut reader, &mut file).map_err(|err| {
+            // Coalesce small blobs; BufWriter passes larger slices directly to the file.
+            let written = (|| {
+                let mut writer = BufWriter::with_capacity(256 * 1024, &mut file);
+                for chunk in content.slice() {
+                    writer.write_all(chunk)?;
+                }
+                // Flush errors must be returned before syncing or publishing the file.
+                writer.flush()
+            })();
+            written.map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::InputOutput,
                     "Failed to write to the buffer: `{path}`. Please check the file and try again.",
@@ -542,10 +547,9 @@ impl WriteBackend for LocalBackend {
         // Write to temporary file
         let filename_tmp = parent.join(Self::filename(tpe, id) + "-tmp-");
         let size = content.size();
-        let reader = content.reader();
         match write_local_file(
             &filename_tmp,
-            reader,
+            &content,
             size.try_into().expect("size too large for u64"), // should not happen
         ) {
             Ok(file) => file,
@@ -622,9 +626,71 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use rustic_core::{FileType, Id, WriteBackend};
+    use rustic_core::{BytesList, FileType, Id, ReadBackend, WriteBackend};
 
     use super::LocalBackend;
+
+    #[test]
+    fn fragmented_writes_flush_tail_and_truncate_replaced_files() {
+        let repo = env::temp_dir().join(format!(
+            "rustic-local-fragments-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let backend = LocalBackend::new(repo.to_string_lossy(), None).unwrap();
+        backend.create().unwrap();
+        let mut content = BytesList::default();
+        let mut expected = Vec::new();
+        for size in [0, 13, 256 * 1024 - 13, 0, 1024 * 1024, 71] {
+            let bytes = vec![u8::try_from(size % 251).unwrap(); size];
+            expected.extend_from_slice(&bytes);
+            content.add(bytes.into());
+        }
+        backend
+            .write_bytes(FileType::Config, &Id::default(), false, content)
+            .unwrap();
+        assert_eq!(
+            backend
+                .read_full(FileType::Config, &Id::default())
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        backend
+            .write_bytes(
+                FileType::Config,
+                &Id::default(),
+                false,
+                Bytes::from_static(b"tail").into(),
+            )
+            .unwrap();
+        assert_eq!(
+            backend
+                .read_full(FileType::Config, &Id::default())
+                .unwrap()
+                .as_ref(),
+            b"tail"
+        );
+        backend
+            .write_bytes(
+                FileType::Config,
+                &Id::default(),
+                false,
+                BytesList::default(),
+            )
+            .unwrap();
+        assert!(
+            backend
+                .read_full(FileType::Config, &Id::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!repo.join("config-tmp-").exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
 
     #[test]
     fn replacing_config_runs_delete_hook_before_create_hook() {
