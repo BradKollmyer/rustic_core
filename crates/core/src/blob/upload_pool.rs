@@ -152,7 +152,7 @@ impl UploadPool {
                     };
                     let result = writer
                         .process((file, id, index))
-                        .and_then(|index| writer.index(index));
+                        .and_then(|index| writer.index_parallel(index));
                     if let Err(error) = result {
                         errors
                             .lock()

@@ -834,6 +834,14 @@ impl<BE: DecryptWriteBackend> FileWriterHandle<BE> {
         self.indexer.write().unwrap().add(index)?;
         Ok(())
     }
+
+    pub(super) fn index_parallel(&self, index: IndexPack) -> RusticResult<()> {
+        let file = self.indexer.write().unwrap().add_and_take(index);
+        if let Some(file) = file {
+            _ = self.be.save_file(&file)?;
+        }
+        Ok(())
+    }
 }
 
 // TODO: add documentation

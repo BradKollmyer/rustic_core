@@ -234,7 +234,8 @@ pub struct PruneOptions {
     pub repack_read_buffer: ByteSize,
 
     /// Maximum admitted serialized index bytes during rebuild, or pack bytes during repack.
-    /// Excludes builders, one pending serialized index, and backend buffers.
+    /// Excludes builders, repack index-publication buffers, and backend buffers.
+    /// Rebuild also excludes one serialized index awaiting admission.
     /// Allow roughly N times pack size, including header overhead, for N concurrent uploads.
     /// Smaller budgets reduce concurrency and may serialize uploads.
     #[cfg_attr(

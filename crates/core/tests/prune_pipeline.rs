@@ -58,6 +58,8 @@ struct Metrics {
     repack_index_puts: AtomicUsize,
     repack_index_peak: AtomicUsize,
     index_failures: AtomicUsize,
+    repack_index_failures: AtomicUsize,
+    stall_only_repack_indexes: AtomicBool,
     index_stall: Mutex<bool>,
     index_wake: Condvar,
     stall: Mutex<bool>,
@@ -288,9 +290,11 @@ impl WriteBackend for DelayedBackend {
             let stalled = m.index_stall.lock().unwrap();
             let (stalled, _) = m
                 .index_wake
-                .wait_timeout_while(stalled, Duration::from_secs(10), |value| *value)
+                .wait_timeout_while(stalled, Duration::from_secs(10), |value| {
+                    *value && (!m.stall_only_repack_indexes.load(SeqCst) || repacking)
+                })
                 .unwrap();
-            if *stalled {
+            if *stalled && (!m.stall_only_repack_indexes.load(SeqCst) || repacking) {
                 return Err(RusticError::new(
                     ErrorKind::Backend,
                     "test index stall deadline",
@@ -302,7 +306,12 @@ impl WriteBackend for DelayedBackend {
             } else {
                 m.index_delay_ms.load(SeqCst)
             }));
-            if m.index_failures
+            let failures = if repacking {
+                &m.repack_index_failures
+            } else {
+                &m.index_failures
+            };
+            if failures
                 .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
@@ -695,6 +704,97 @@ fn index_upload_failure_preserves_old_indexes_and_packs_and_joins_workers() -> R
 }
 
 #[test]
+fn stalled_repack_indexes_release_lock_and_respect_connection_limit() -> Result<()> {
+    let seed = seed_layout_bytes(32, 1, 64, 64 * 1024, false)?;
+    for fast in [false, true] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let m = backend.metrics;
+        // Two packs need headroom for their final blobs and headers.
+        let opts = opts(Some(2), fast).repack_upload_buffer(ByteSize::mib(3));
+        let plan = repo.prune_plan(&opts)?;
+        m.stall_only_repack_indexes.store(true, SeqCst);
+        *m.index_stall.lock().unwrap() = true;
+        m.enabled.store(true, SeqCst);
+        let worker = thread::spawn(move || {
+            let result = repo.prune(&opts, plan);
+            (repo, result)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while m.repack_index_puts.load(SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let overlapping = m.repack_index_puts.load(SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        let gets = m.gets.load(SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        let stable = m.gets.load(SeqCst) == gets;
+        *m.index_stall.lock().unwrap() = false;
+        m.index_wake.notify_all();
+        let (repo, result) = worker.join().unwrap();
+        result?;
+        assert_eq!(
+            overlapping, 2,
+            "stalled index upload blocked other pack workers"
+        );
+        assert!(
+            stable,
+            "downloads did not backpressure on stalled index uploads"
+        );
+        assert!(m.peak.load(SeqCst) <= 2);
+        assert_eq!(m.active.load(SeqCst), 0);
+        assert!(m.deletes.load(SeqCst) > 0);
+        published_after_upload(&repo, &m)?;
+        m.enabled.store(false, SeqCst);
+        repo.check(CheckOptions::default().read_data(true))?
+            .is_ok()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn repack_index_failure_preserves_old_data_and_aggregates_worker_errors() -> Result<()> {
+    let seed = seed_layout_bytes(32, 1, 64, 64 * 1024, false)?;
+    for fast in [false, true] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let m = &backend.metrics;
+        let old_packs: BTreeSet<_> = backend.list(FileType::Pack)?.into_iter().collect();
+        let old_indexes: BTreeSet<_> = backend.list(FileType::Index)?.into_iter().collect();
+        let opts = opts(Some(5), fast);
+        let plan = repo.prune_plan(&opts)?;
+        m.repack_index_failures.store(2, SeqCst);
+        m.repack_index_delay_ms.store(300, SeqCst);
+        m.enabled.store(true, SeqCst);
+        let error = repo.prune(&opts, plan).unwrap_err();
+        assert!(
+            error.to_string().contains("injected index upload failure"),
+            "{error}"
+        );
+        let failures = 2 - m.repack_index_failures.load(SeqCst);
+        assert!(failures > 0);
+        assert_eq!(
+            error.context_value("upload_failures"),
+            Some(failures.to_string().as_str())
+        );
+        assert!(error.context_value("failed_index").is_some());
+        assert!(
+            error
+                .context_value("upload_errors")
+                .unwrap()
+                .contains("injected index upload failure")
+        );
+        assert_eq!(m.deletes.load(SeqCst), 0);
+        assert_eq!(m.active.load(SeqCst), 0);
+        assert!(old_packs.is_subset(&backend.list(FileType::Pack)?.into_iter().collect()));
+        assert!(old_indexes.is_subset(&backend.list(FileType::Index)?.into_iter().collect()));
+        published_after_upload(&repo, m)?;
+        m.enabled.store(false, SeqCst);
+        repo.check(CheckOptions::default().read_data(true))?
+            .is_ok()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn read_failure_joins_uploads_without_deleting_old_data() -> Result<()> {
     let seed = seed(32)?;
     for fast in [false, true] {
@@ -808,10 +908,7 @@ fn benchmark_seed() -> Result<Seed> {
     )
 }
 
-#[test]
-#[ignore = "local latency benchmark; run explicitly with --ignored --nocapture"]
-#[allow(clippy::cast_precision_loss)]
-fn benchmark_prune_pipeline() -> Result<()> {
+fn benchmark_fixture() -> Result<Seed> {
     let seed = if let Ok(path) = std::env::var("PRUNE_LAB_SEED") {
         let path = Path::new(&path);
         if path.join("key.json").exists() {
@@ -830,6 +927,14 @@ fn benchmark_prune_pipeline() -> Result<()> {
     } else {
         benchmark_seed()?
     };
+    Ok(seed)
+}
+
+#[test]
+#[ignore = "local latency benchmark; run explicitly with --ignored --nocapture"]
+#[allow(clippy::cast_precision_loss)]
+fn benchmark_prune_pipeline() -> Result<()> {
+    let seed = benchmark_fixture()?;
     println!("case,repeat,seconds,read_mib,write_mib,peak_get,peak_put,peak_io,overlap");
     for (name, read_ms, write_ms) in [("local", 0, 0), ("latency", 20, 60)] {
         for repeat in 0..3 {

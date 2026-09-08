@@ -186,6 +186,25 @@ impl<BE: DecryptWriteBackend> Indexer<BE> {
     ///
     /// * If the index file could not be serialized.
     pub fn add_with(&mut self, pack: IndexPack, delete: bool) -> RusticResult<()> {
+        if self.record_pack(pack, delete) {
+            self.save()?;
+            self.reset();
+        }
+        Ok(())
+    }
+
+    /// Detach a full index for an upload worker to save after releasing the indexer lock.
+    /// The caller must finish that upload before finalizing the index or deleting old data.
+    pub(crate) fn add_and_take(&mut self, pack: IndexPack) -> Option<IndexFile> {
+        if !self.record_pack(pack, false) {
+            return None;
+        }
+        let file = std::mem::take(&mut self.file);
+        self.reset();
+        Some(file)
+    }
+
+    fn record_pack(&mut self, pack: IndexPack, delete: bool) -> bool {
         self.count += pack.blobs.len();
 
         if let Some(indexed) = &mut self.indexed {
@@ -201,11 +220,7 @@ impl<BE: DecryptWriteBackend> Indexer<BE> {
             warn!("couldn't get elapsed time from system time: {err:?}");
             Duration::ZERO
         });
-        if self.count >= constants::MAX_COUNT || elapsed >= constants::MAX_AGE {
-            self.save()?;
-            self.reset();
-        }
-        Ok(())
+        self.count >= constants::MAX_COUNT || elapsed >= constants::MAX_AGE
     }
 
     /// Returns whether the given id is indexed.

@@ -38,6 +38,13 @@ packs. The completed-pack channel is unbuffered. A download worker keeps its
 slot until it has handed the blobs to the packer, so producers cannot keep
 fetching indefinitely while uploads are blocked.
 
+During repacking, a worker detaches a completed index under the shared indexer
+lock, then serializes and uploads it after releasing that lock. It retains its
+existing I/O permit until the index save finishes. Pack GETs, pack PUTs, and
+repack index PUTs therefore still share the same N-operation limit; no extra
+queue or worker pool is introduced. Workers are joined before the final partial
+index is saved and before old indexes or packs are deleted.
+
 A pack enters the index only after its upload succeeds. On failure, I/O and
 memory waiters are cancelled, blocked channel senders and workers are woken,
 both packers are closed, and all upload workers are joined. Backend errors
@@ -70,7 +77,9 @@ configured bytes; the budget is never silently exceeded.
 
 These are not total RSS limits. Two pack builders, decoded/compression buffers,
 indexes, allocator overhead, cache, and backend-private buffers use additional
-memory. A builder may hold a full pack while waiting for upload admission.
+memory. Each repack upload worker can hold one detached index and its serialization,
+compression, and encryption buffers while publishing it; these metadata buffers
+are outside the pack-body byte budget. A builder may hold a full pack while waiting for upload admission.
 During rebuilding, the producer can hold one serialized index waiting for byte
 admission in addition to the index builder. Worker compression/encryption and
 verification buffers are additional memory. An index larger than the upload
