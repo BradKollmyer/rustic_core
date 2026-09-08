@@ -1029,3 +1029,23 @@ fn benchmark_prune_pipeline() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn undersized_pack_budget_fails_before_prune_mutation() -> Result<()> {
+    let seed = seed(8)?;
+    let (_dir, repo, backend) = trial(&seed)?;
+    let opts = opts(Some(5), true).repack_upload_buffer(ByteSize::kib(64));
+    let plan = repo.prune_plan(&opts)?;
+    let m = &backend.metrics;
+    m.enabled.store(true, SeqCst);
+    let error = repo.prune(&opts, plan).unwrap_err();
+    assert_eq!(
+        error.context_value("option"),
+        Some("--repack-upload-buffer")
+    );
+    assert_eq!(m.gets.load(SeqCst), 0);
+    assert_eq!(m.puts.load(SeqCst), 0);
+    assert_eq!(m.index_puts.load(SeqCst), 0);
+    assert_eq!(m.deletes.load(SeqCst), 0);
+    Ok(())
+}

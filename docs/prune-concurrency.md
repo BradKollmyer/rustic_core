@@ -75,6 +75,12 @@ budget is full. Zero budgets are rejected. A single blob or completed pack
 larger than its allowance fails with the option name, required bytes, and
 configured bytes; the budget is never silently exceeded.
 
+Prune checks the target pack sizes, capped by each type's estimated retained
+repack bytes, against the upload budget before warmup or repository mutation.
+This catches clearly undersized settings before rebuilding indexes or copying
+packs. It is a planning check, not an exact output-size prediction: final blob,
+header, and compression overhead can still trigger the runtime size guard.
+
 These are not total RSS limits. Two pack builders, decoded/compression buffers,
 indexes, allocator overhead, cache, and backend-private buffers use additional
 memory. Each repack upload worker can hold one detached index and its serialization,
