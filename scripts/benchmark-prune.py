@@ -25,8 +25,11 @@ def main():
     parser.add_argument('--write-mibps', type=int, default=0)
     parser.add_argument('--read-buffer-mib', type=int, default=128)
     parser.add_argument('--upload-buffer-mib', type=int, default=256)
+    parser.add_argument('--binary', type=Path, help='Run a previously built benchmark executable for cross-commit comparisons')
     parser.add_argument('--seed', type=Path, help='Reuse a disposable fixture directory across builds; retains its test key until removed')
     parser.add_argument('--index-heavy', action='store_true', help='64-byte chunks in 1MiB files; skip pack repacking to measure index rebuilding')
+    parser.add_argument('--repack-index-heavy', action='store_true', help='64-byte chunks in 64KiB files; retain half to force multiple repack index saves')
+    parser.add_argument('--fast-repack', action='store_true')
     parser.add_argument('--index-delay-ms', type=int, default=500)
     parser.add_argument('--profile', action='store_true', help='Capture macOS sample profiles during prune')
     parser.add_argument('--repeats', type=int, default=3)
@@ -38,14 +41,19 @@ def main():
         parser.error('sizes, byte budgets, and repeats must be positive')
     if min(args.read_mibps, args.write_mibps, args.index_delay_ms) < 0:
         parser.error('transfer rates must be nonnegative')
+    if args.index_heavy and args.repack_index_heavy:
+        parser.error('choose only one index workload')
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    build = subprocess.run(['cargo', 'test', '--offline', '--locked', '-p', 'rustic_core', '--test', 'prune_pipeline', '--no-run', '--message-format=json'],
-                           cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-    (output / 'build.log').write_text(build.stderr)
-    artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith('{')]
-    binary = next(record['executable'] for record in artifacts if record.get('executable') and record.get('target', {}).get('name') == 'prune_pipeline')
+    if args.binary:
+        binary = str(args.binary.resolve())
+    else:
+        build = subprocess.run(['cargo', 'test', '--offline', '--locked', '-p', 'rustic_core', '--test', 'prune_pipeline', '--no-run', '--message-format=json'],
+                               cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        (output / 'build.log').write_text(build.stderr)
+        artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith('{')]
+        binary = next(record['executable'] for record in artifacts if record.get('executable') and record.get('target', {}).get('name') == 'prune_pipeline')
     command = [binary, 'benchmark_prune_pipeline', '--ignored', '--nocapture', '--test-threads=1']
     results = []
     (output / 'parameters.json').write_text(json.dumps(vars(args), default=str, indent=2) + '\n')
@@ -61,6 +69,11 @@ def main():
         if args.index_heavy:
             env['PRUNE_LAB_INDEX_HEAVY'] = '1'
             env['PRUNE_LAB_INDEX_DELAY_MS'] = str(args.index_delay_ms)
+        if args.repack_index_heavy:
+            env['PRUNE_LAB_REPACK_INDEX_HEAVY'] = '1'
+            env['PRUNE_LAB_INDEX_DELAY_MS'] = str(args.index_delay_ms)
+        if args.fast_repack:
+            env['PRUNE_LAB_FAST_REPACK'] = '1'
         print('Preparing local fixture...', flush=True)
         prep = subprocess.run(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         (output / 'prepare.log').write_text(prep.stdout)
@@ -118,6 +131,8 @@ def main():
                               peak_rss_mib=max(samples) / 1024 if samples else None, samples=len(samples))
                 if len(fields) >= 12:
                     record.update(index_puts=int(fields[9]), peak_index_puts=int(fields[10]), index_mib=float(fields[11]))
+                if len(fields) >= 14:
+                    record.update(repack_index_puts=int(fields[12]), peak_repack_index_puts=int(fields[13]))
                 results.append(record)
                 print(json.dumps(record), flush=True)
                 (output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')

@@ -54,6 +54,9 @@ struct Metrics {
     index_peak: AtomicUsize,
     index_bytes: AtomicU64,
     index_delay_ms: AtomicU64,
+    repack_index_delay_ms: AtomicU64,
+    repack_index_puts: AtomicUsize,
+    repack_index_peak: AtomicUsize,
     index_failures: AtomicUsize,
     index_stall: Mutex<bool>,
     index_wake: Condvar,
@@ -275,6 +278,12 @@ impl WriteBackend for DelayedBackend {
             m.peak.fetch_max(m.active.fetch_add(1, SeqCst) + 1, SeqCst);
             let _active = IndexActive(m);
             m.index_puts.fetch_add(1, SeqCst);
+            let repacking = m.gets.load(SeqCst) > 0;
+            if repacking {
+                m.repack_index_puts.fetch_add(1, SeqCst);
+                m.repack_index_peak
+                    .fetch_max(m.index_active.load(SeqCst), SeqCst);
+            }
             m.index_bytes.fetch_add(data.size() as u64, SeqCst);
             let stalled = m.index_stall.lock().unwrap();
             let (stalled, _) = m
@@ -288,7 +297,11 @@ impl WriteBackend for DelayedBackend {
                 ));
             }
             drop(stalled);
-            thread::sleep(Duration::from_millis(m.index_delay_ms.load(SeqCst)));
+            thread::sleep(Duration::from_millis(if repacking {
+                m.repack_index_delay_ms.load(SeqCst)
+            } else {
+                m.index_delay_ms.load(SeqCst)
+            }));
             if m.index_failures
                 .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                 .is_ok()
@@ -770,6 +783,15 @@ fn benchmark_value(name: &str, default: u64) -> u64 {
 }
 
 fn benchmark_seed() -> Result<Seed> {
+    if std::env::var_os("PRUNE_LAB_REPACK_INDEX_HEAVY").is_some() {
+        return seed_layout_bytes(
+            usize::try_from(benchmark_value("PRUNE_LAB_MIB", 64))?,
+            1,
+            64,
+            64 * 1024,
+            false,
+        );
+    }
     if std::env::var_os("PRUNE_LAB_INDEX_HEAVY").is_some() {
         return seed_layout_bytes(
             usize::try_from(benchmark_value("PRUNE_LAB_MIB", 64))?,
@@ -827,7 +849,7 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 }
                 let (_dir, repo, backend) = trial(&seed)?;
                 let m = &backend.metrics;
-                let mut opts = opts(n, false)
+                let mut opts = opts(n, std::env::var_os("PRUNE_LAB_FAST_REPACK").is_some())
                     .repack_read_buffer(ByteSize::mib(benchmark_value(
                         "PRUNE_LAB_READ_BUFFER_MIB",
                         128,
@@ -844,6 +866,10 @@ fn benchmark_prune_pipeline() -> Result<()> {
                             .store(benchmark_value("PRUNE_LAB_INDEX_DELAY_MS", 500), SeqCst);
                     }
                 }
+                if name == "latency" {
+                    m.repack_index_delay_ms
+                        .store(benchmark_value("PRUNE_LAB_INDEX_DELAY_MS", 0), SeqCst);
+                }
                 let plan = repo.prune_plan(&opts)?;
                 m.read_ms.store(read_ms, SeqCst);
                 m.write_ms.store(write_ms, SeqCst);
@@ -859,7 +885,7 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 repo.prune(&opts, plan)?;
                 let elapsed = start.elapsed().as_secs_f64();
                 println!(
-                    "{name}-{}, {repeat}, {elapsed:.3}, {:.2}, {:.2}, {}, {}, {}, {}, {}, {}, {:.2}",
+                    "{name}-{}, {repeat}, {elapsed:.3}, {:.2}, {:.2}, {}, {}, {}, {}, {}, {}, {:.2}, {}, {}",
                     n.map_or_else(|| "baseline".into(), |n| n.to_string()),
                     m.read_bytes.load(SeqCst) as f64 / 1_048_576.,
                     m.write_bytes.load(SeqCst) as f64 / 1_048_576.,
@@ -870,12 +896,23 @@ fn benchmark_prune_pipeline() -> Result<()> {
                     m.index_puts.load(SeqCst),
                     m.index_peak.load(SeqCst),
                     m.index_bytes.load(SeqCst) as f64 / 1_048_576.,
+                    m.repack_index_puts.load(SeqCst),
+                    m.repack_index_peak.load(SeqCst),
                 );
                 if std::env::var_os("PRUNE_LAB_INDEX_HEAVY").is_some() {
                     assert!(
                         m.index_puts.load(SeqCst) >= 5,
                         "fixture must rebuild multiple output indexes"
                     );
+                }
+                if std::env::var_os("PRUNE_LAB_REPACK_INDEX_HEAVY").is_some() {
+                    assert!(
+                        m.repack_index_puts.load(SeqCst) >= 5,
+                        "fixture must save multiple indexes during repack"
+                    );
+                    if let Some(n) = n {
+                        assert!(m.peak.load(SeqCst) <= n);
+                    }
                 }
                 published_after_upload(&repo, m)?;
                 m.enabled.store(false, SeqCst);
