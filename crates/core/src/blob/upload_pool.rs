@@ -1,4 +1,4 @@
-//! Opt-in prune upload pool. Pack bodies share one rendezvous queue and I/O budget.
+//! Opt-in pack upload pool. Pack bodies share one rendezvous queue and I/O budget.
 
 use super::{
     byte_budget::{ByteBudget, BytePermit, RepackBuffers},
@@ -112,7 +112,7 @@ impl UploadPool {
     ) -> RusticResult<Self> {
         Self::with_spawner(be, indexer, n, budget, buffers, |job| {
             std::thread::Builder::new()
-                .name("prune-pack".into())
+                .name("pack-upload".into())
                 .spawn(job)
         })
     }
@@ -194,7 +194,7 @@ impl UploadPool {
             .map_err(|error| {
                 RusticError::with_source(
                     ErrorKind::Internal,
-                    "Cannot start prune pack upload worker.",
+                    "Cannot start pack upload worker.",
                     error,
                 )
             })?;
@@ -222,7 +222,7 @@ impl UploadPool {
     pub(crate) fn finalize(mut self) -> RusticResult<()> {
         self.join();
         log::debug!(
-            "repack buffer peaks: reads {} bytes, uploads {} bytes",
+            "pack buffer peaks: reads {} bytes, uploads {} bytes",
             self.buffers.reads.peak(),
             self.buffers.uploads.peak()
         );

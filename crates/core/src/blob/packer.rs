@@ -247,7 +247,7 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn new_with_uploads(
+    pub(crate) fn new_with_uploads(
         be: BE,
         blob_type: BlobType,
         indexer: SharedIndexer<BE>,

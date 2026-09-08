@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--size-mib', type=int, default=4096)
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--parallel-uploads', action='store_true')
     args = parser.parse_args()
     if args.size_mib < 64 or args.size_mib % 64:
         parser.error('size must be a positive multiple of 64 MiB')
@@ -49,9 +50,9 @@ def main():
     binary = args.binary.resolve()
     manifest = dict(endpoint=credentials['CEPH_FURIES_S3_ENDPOINT'], bucket=bucket, prefix=prefix,
         source_mib=args.size_mib, file_mib=16, pack_mib=128, backend_connections=5,
-        fd_limit=1024, profiled=args.profile, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        fd_limit=1024, profiled=args.profile, parallel_uploads=args.parallel_uploads, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
     (output/'parameters.json').write_text(json.dumps(manifest, indent=2)+'\n')
-    env = dict(os.environ, **credentials, PRUNE_S3_ROOT=prefix, BACKUP_S3_MIB=str(args.size_mib))
+    env = dict(os.environ, **credentials, PRUNE_S3_ROOT=prefix, BACKUP_S3_MIB=str(args.size_mib), BACKUP_PARALLEL_UPLOADS=str(int(args.parallel_uploads)))
     def limits():
         _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))

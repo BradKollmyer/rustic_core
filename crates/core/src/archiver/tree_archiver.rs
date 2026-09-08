@@ -10,6 +10,7 @@ use crate::{
         BlobType,
         packer::{PackSizer, Packer},
         tree::{Tree, TreeId},
+        upload_pool::UploadSender,
     },
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadGlobalIndex, indexer::SharedIndexer},
@@ -64,11 +65,13 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> TreeArchiver<'a, BE, I> {
         index: &'a I,
         indexer: SharedIndexer<BE>,
         config: &ConfigFile,
+        uploads: Option<UploadSender>,
         summary: SnapshotSummary,
     ) -> RusticResult<Self> {
         let pack_sizer =
             PackSizer::from_config(config, BlobType::Tree, index.total_size(BlobType::Tree));
-        let tree_packer = Packer::new(be, BlobType::Tree, indexer, pack_sizer)?;
+        let tree_packer =
+            Packer::new_with_uploads(be, BlobType::Tree, indexer, pack_sizer, uploads)?;
 
         Ok(Self {
             tree: Tree::new(),

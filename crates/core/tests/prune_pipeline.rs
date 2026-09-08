@@ -1244,7 +1244,9 @@ fn benchmark_backup_s3() -> Result<()> {
         &config,
     )?;
     let paths = PathList::from_iter([source.clone()]);
-    let backup_options = BackupOptions::default().as_path(Path::new("source").to_path_buf());
+    let backup_options = BackupOptions::default()
+        .as_path(Path::new("source").to_path_buf())
+        .parallel_uploads(benchmark_value("BACKUP_PARALLEL_UPLOADS", 0) != 0);
     for stage in ["initial", "unchanged", "changed"] {
         if stage == "changed" {
             for file in (0..file_count).step_by(4) {
@@ -1298,6 +1300,98 @@ fn benchmark_backup_s3() -> Result<()> {
         published_after_upload(&repo, m)?;
         verify_s3_backup(repo, &snapshot, &source, file_count)?;
         println!("CHECK {stage} passed (full repository check and byte-for-byte restore)");
+    }
+    Ok(())
+}
+
+#[test]
+fn parallel_backup_uploads_are_bounded_and_restore() -> Result<()> {
+    let seed = seed(2)?;
+    let source = tempdir()?;
+    let mut random = 123_u64;
+    for file in 0..2 {
+        backup_benchmark_file(
+            &source.path().join(format!("{file:06}")),
+            16 * 1024 * 1024,
+            &mut random,
+        )?;
+    }
+    for (parallel, limit) in [(false, 3), (true, 1), (true, 3)] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let m = &backend.metrics;
+        m.connection_limit.store(limit, SeqCst);
+        m.write_ms.store(50, SeqCst);
+        m.enabled.store(true, SeqCst);
+        let repo = repo.to_indexed_ids()?;
+        let snapshot = repo.backup(
+            &BackupOptions::default()
+                .parallel_uploads(parallel)
+                .backup_upload_buffer(Some(ByteSize::mib(8)))
+                .as_path(Path::new("source").to_path_buf()),
+            &PathList::from_iter([source.path().to_path_buf()]),
+            SnapshotFile::default(),
+        )?;
+        assert_eq!(snapshot.summary.as_ref().unwrap().error_count, 0);
+        let peak = m.peak_data_writes.load(SeqCst);
+        assert!(peak <= limit);
+        assert!(m.peak_write_bytes.load(SeqCst) <= 8 * 1024 * 1024);
+        if parallel && limit > 1 {
+            assert!(peak > 1);
+        } else {
+            assert_eq!(peak, 1);
+        }
+        assert_eq!(m.active.load(SeqCst), 0);
+        let repo = repo.drop_index();
+        published_after_upload(&repo, m)?;
+        m.enabled.store(false, SeqCst);
+        verify_s3_backup(repo, &snapshot, source.path(), 2)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn parallel_backup_failures_do_not_publish_snapshots() -> Result<()> {
+    let seed = seed(2)?;
+    let source = tempdir()?;
+    backup_benchmark_file(&source.path().join("new"), 32 * 1024 * 1024, &mut 987_u64)?;
+    for failure in ["pack", "index", "budget"] {
+        let (_dir, repo, backend) = trial(&seed)?;
+        let before = repo.list::<rustic_core::repofile::SnapshotId>()?.count();
+        let m = &backend.metrics;
+        m.connection_limit.store(3, SeqCst);
+        m.enabled.store(true, SeqCst);
+        let mut options = BackupOptions::default().parallel_uploads(true);
+        match failure {
+            "pack" => {
+                m.failures.store(3, SeqCst);
+            }
+            "index" => {
+                m.index_failures.store(1, SeqCst);
+            }
+            _ => {
+                options = options.backup_upload_buffer(Some(ByteSize::b(1)));
+            }
+        }
+        let repo = repo.to_indexed_ids()?;
+        let error = repo
+            .backup(
+                &options,
+                &PathList::from_iter([source.path().to_path_buf()]),
+                SnapshotFile::default(),
+            )
+            .unwrap_err();
+        if failure == "pack" {
+            assert!(error.to_string().contains("injected pack upload failure"));
+        }
+        assert_eq!(m.active.load(SeqCst), 0);
+        assert_eq!(
+            repo.list::<rustic_core::repofile::SnapshotId>()?.count(),
+            before
+        );
+        if failure == "budget" {
+            assert_eq!(m.puts.load(SeqCst), 0);
+        }
+        published_after_upload(&repo.drop_index(), m)?;
     }
     Ok(())
 }

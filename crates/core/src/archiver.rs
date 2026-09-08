@@ -18,8 +18,13 @@ use crate::{
         tree_archiver::TreeArchiver,
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
-    blob::BlobType,
-    error::{RusticError, RusticResult},
+    blob::{
+        BlobType,
+        byte_budget::{ByteBudget, RepackBuffers},
+        packer::PackSizer,
+        upload_pool::{IoBudget, UploadPool},
+    },
+    error::{ErrorKind, RusticError, RusticResult},
     index::{
         ReadGlobalIndex,
         indexer::{Indexer, SharedIndexer},
@@ -53,6 +58,8 @@ pub struct Archiver<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> {
     /// The `TreeArchiver` is responsible for archiving trees.
     tree_archiver: TreeArchiver<'a, BE, I>,
 
+    uploads: Option<UploadPool>,
+
     /// The parent snapshot to use.
     parent: Parent,
 
@@ -84,23 +91,64 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     ///
     /// * If sending the message to the raw packer fails.
     /// * If converting the data length to u64 fails
-    pub fn new(
+    pub(crate) fn new(
         be: BE,
         index: &'a I,
         config: &ConfigFile,
         parent: Parent,
         mut snap: SnapshotFile,
+        upload_bytes: Option<u64>,
     ) -> RusticResult<Self> {
         let indexer = Indexer::new(be.clone()).into_shared();
         let mut summary = snap.summary.take().unwrap_or_default();
         summary.backup_start = Zoned::now();
 
-        let file_archiver = FileArchiver::new(be.clone(), index, indexer.clone(), config)?;
-        let tree_archiver = TreeArchiver::new(be.clone(), index, indexer.clone(), config, summary)?;
+        let uploads = upload_bytes
+            .map(|bytes| -> RusticResult<_> {
+                // Validate before reading source files. The runtime byte permit also covers
+                // growth and the final blob/header that can exceed the current pack target.
+                let required = [BlobType::Data, BlobType::Tree]
+                    .into_iter()
+                    .map(|kind| {
+                        u64::from(
+                            PackSizer::from_config(config, kind, index.total_size(kind))
+                                .pack_size(),
+                        )
+                    })
+                    .max()
+                    .unwrap();
+                if bytes == 0 || bytes < required {
+                    return Err(RusticError::new(
+                        ErrorKind::InvalidInput,
+                        "Parallel backup pack target exceeds --backup-upload-buffer.",
+                    )
+                    .attach_context("required_bytes", required.to_string())
+                    .attach_context("budget_bytes", bytes.to_string()));
+                }
+                let n = be.connection_limit().unwrap_or(5).clamp(1, 5);
+                let buffers = RepackBuffers {
+                    reads: ByteBudget::new(0, "unused backup reads"),
+                    uploads: ByteBudget::new(bytes, "--backup-upload-buffer"),
+                };
+                UploadPool::new(&be, &indexer, n, &IoBudget::new(n), &buffers)
+            })
+            .transpose()?;
+        let sender = || uploads.as_ref().map(UploadPool::sender);
+        let file_archiver =
+            FileArchiver::new(be.clone(), index, indexer.clone(), config, sender())?;
+        let tree_archiver = TreeArchiver::new(
+            be.clone(),
+            index,
+            indexer.clone(),
+            config,
+            sender(),
+            summary,
+        )?;
 
         Ok(Self {
             file_archiver,
             tree_archiver,
+            uploads,
             parent,
             indexer,
             be,
@@ -147,7 +195,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     {
         let error_count = AtomicU64::new(0);
 
-        scope(|s| -> RusticResult<_> {
+        let archived = scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
                 if !no_scan && !p.is_hidden() {
@@ -217,10 +265,18 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 .expect("Scoped Size Handler thread should not panic!");
 
             Ok(())
-        })?;
+        });
 
-        let stats = self.file_archiver.finalize()?;
-        let (id, mut summary) = self.tree_archiver.finalize(self.parent.tree_id())?;
+        let stats = self.file_archiver.finalize();
+        let tree = self.tree_archiver.finalize(self.parent.tree_id());
+        // Drain both packers before joining uploads; preserve the backend failure
+        // over secondary channel errors, and publish no snapshot until all succeed.
+        if let Some(uploads) = self.uploads.take() {
+            uploads.finalize()?;
+        }
+        archived?;
+        let stats = stats?;
+        let (id, mut summary) = tree?;
         stats.apply(&mut summary, BlobType::Data);
         summary.error_count = error_count.load(Ordering::Relaxed);
         self.snap.tree = id;

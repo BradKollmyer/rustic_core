@@ -140,6 +140,7 @@ impl ParentOptions {
     }
 }
 
+#[serde_as]
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
 #[cfg_attr(feature = "merge", derive(conflate::Merge))]
 #[derive(Clone, Default, Debug, Deserialize, Serialize, Setters)]
@@ -148,6 +149,17 @@ impl ParentOptions {
 #[non_exhaustive]
 /// Options for the `backup` command.
 pub struct BackupOptions {
+    /// Upload backup packs in parallel, using up to five workers and the backend connection limit.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub parallel_uploads: bool,
+
+    /// Limit completed parallel backup pack buffers (default: 1 GiB). Small buffers reduce concurrency.
+    #[cfg_attr(feature = "clap", clap(long, requires = "parallel_uploads"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub backup_upload_buffer: Option<bytesize::ByteSize>,
+
     /// Set filename to be used when backing up from stdin
     #[cfg_attr(
         feature = "clap",
@@ -284,7 +296,12 @@ where
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
     info!("starting to backup {backup_paths:?} ...");
-    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
+    let upload_bytes = opts.parallel_uploads.then(|| {
+        opts.backup_upload_buffer
+            .unwrap_or(bytesize::ByteSize::gib(1))
+            .as_u64()
+    });
+    let archiver = Archiver::new(be, index, repo.config(), parent, snap, upload_bytes)?;
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(

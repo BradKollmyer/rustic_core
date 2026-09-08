@@ -81,6 +81,10 @@ impl<BE: DecryptFullBackend> DecryptReadBackend for DryRunBackend<BE> {
 }
 
 impl<BE: DecryptFullBackend> ReadBackend for DryRunBackend<BE> {
+    fn connection_limit(&self) -> Option<usize> {
+        self.be.connection_limit()
+    }
+
     fn location(&self) -> String {
         self.be.location()
     }
