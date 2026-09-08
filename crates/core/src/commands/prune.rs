@@ -1633,8 +1633,8 @@ pub(crate) fn prune_repository<S: Open>(
                         })
                         .collect();
 
-                    // With a dedicated pool, each reader retains its worker slot
-                    // through the handoff to the packer, bounding downloaded buffers.
+                    // Download threads stay occupied through packer handoff;
+                    // I/O permits cover only read_partial.
                     blob_chunks.into_par_iter().try_for_each(|blobs| {
                         if opts.fast_repack {
                             repacker.copy_fast(blobs, &p)

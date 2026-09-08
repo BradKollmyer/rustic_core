@@ -536,9 +536,7 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
         let data = self.be.key().encrypt_data(&data)?.into();
         self.basic.write_header(data)?;
 
-        // write file to backend
-        // Wait while the pack is still owned by its builder. Once detached,
-        // every pack carries a byte permit through hashing, upload and indexing.
+        // Reserve before detaching so a waiting builder cannot start another pack.
         let bytes = self
             .shared_uploads
             .as_ref()
@@ -550,7 +548,7 @@ impl<BE: DecryptWriteBackend> RawPacker<BE> {
                 file,
                 index,
                 self.basic.blob_type.is_cacheable(),
-                bytes.unwrap(),
+                bytes.expect("parallel pack bytes reserved before detaching"),
             );
         }
         self.file_writer
