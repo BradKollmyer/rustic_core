@@ -18,7 +18,7 @@ OpenDAL `connections=5` caps `--repack-connections 10` at 5. Hot/cold repositori
 use the smaller known limit of the two routes. At least two connections are
 needed; invalid settings fail before repository mutation.
 
-The limit is for this process's repack work. Other phases, other processes, and
+The limit is for this process's index-rebuild and repack work. Other phases, other processes, and
 other repository clients retain their own limits. OpenDAL's existing limiter
 continues to apply to its backend operations.
 
@@ -86,7 +86,8 @@ rustic prune --parallel-repack --repack-connections 5 \
   --repack-read-buffer 128MiB --repack-upload-buffer 1GiB
 ```
 
-Debug logging reports peak admitted read and upload bytes at pool finalization.
+Debug logging reports peak admitted serialized-index bytes after rebuild, and
+peak admitted read and pack-upload bytes after repacking.
 
 ## Local validation and benchmarks
 
