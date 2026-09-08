@@ -49,10 +49,25 @@ struct Metrics {
     write_mib_per_second: AtomicU64,
     failures: AtomicUsize,
     fail_read_at: AtomicUsize,
+    index_puts: AtomicUsize,
+    index_active: AtomicUsize,
+    index_peak: AtomicUsize,
+    index_bytes: AtomicU64,
+    index_delay_ms: AtomicU64,
+    index_failures: AtomicUsize,
+    index_stall: Mutex<bool>,
+    index_wake: Condvar,
     stall: Mutex<bool>,
     wake: Condvar,
     completed: Mutex<BTreeSet<Id>>,
     published: Mutex<Vec<(Id, BTreeSet<Id>)>>,
+}
+struct IndexActive<'a>(&'a Metrics);
+impl Drop for IndexActive<'_> {
+    fn drop(&mut self) {
+        self.0.index_active.fetch_sub(1, SeqCst);
+        self.0.active.fetch_sub(1, SeqCst);
+    }
 }
 struct HeldBytes {
     metrics: Arc<Metrics>,
@@ -192,6 +207,11 @@ impl WriteBackend for DelayedBackend {
     }
     fn remove(&self, t: FileType, id: &Id, c: bool) -> RusticResult<()> {
         if self.metrics.enabled.load(SeqCst) {
+            assert_eq!(
+                self.metrics.index_active.load(SeqCst),
+                0,
+                "deletion raced an index upload"
+            );
             self.metrics.deletes.fetch_add(1, SeqCst);
         }
         self.inner.remove(t, id, c)
@@ -241,14 +261,42 @@ impl WriteBackend for DelayedBackend {
             self.inner.write_bytes(t, id, c, data)?;
             self.metrics.completed.lock().unwrap().insert(*id);
             Ok(())
-        } else {
-            if t == FileType::Index {
-                self.metrics
-                    .published
-                    .lock()
-                    .unwrap()
-                    .push((*id, self.metrics.completed.lock().unwrap().clone()));
+        } else if t == FileType::Index {
+            let m = &self.metrics;
+            m.index_peak
+                .fetch_max(m.index_active.fetch_add(1, SeqCst) + 1, SeqCst);
+            m.peak.fetch_max(m.active.fetch_add(1, SeqCst) + 1, SeqCst);
+            let _active = IndexActive(m);
+            m.index_puts.fetch_add(1, SeqCst);
+            m.index_bytes.fetch_add(data.size() as u64, SeqCst);
+            let stalled = m.index_stall.lock().unwrap();
+            let (stalled, _) = m
+                .index_wake
+                .wait_timeout_while(stalled, Duration::from_secs(10), |value| *value)
+                .unwrap();
+            if *stalled {
+                return Err(RusticError::new(
+                    ErrorKind::Backend,
+                    "test index stall deadline",
+                ));
             }
+            drop(stalled);
+            thread::sleep(Duration::from_millis(m.index_delay_ms.load(SeqCst)));
+            if m.index_failures
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(
+                    RusticError::new(ErrorKind::Backend, "injected index upload failure")
+                        .attach_context("failed_index", id.to_string()),
+                );
+            }
+            m.published
+                .lock()
+                .unwrap()
+                .push((*id, m.completed.lock().unwrap().clone()));
+            self.inner.write_bytes(t, id, c, data)
+        } else {
             self.inner.write_bytes(t, id, c, data)
         }
     }
@@ -263,6 +311,22 @@ fn seed(mebibytes: usize) -> Result<Seed> {
 }
 
 fn seed_layout(mebibytes: usize, pack_mib: u64, chunk_kib: u64) -> Result<Seed> {
+    seed_layout_bytes(
+        mebibytes,
+        pack_mib,
+        usize::try_from(chunk_kib * 1024)?,
+        usize::try_from(chunk_kib * 1024)?,
+        false,
+    )
+}
+
+fn seed_layout_bytes(
+    mebibytes: usize,
+    pack_mib: u64,
+    chunk_bytes: usize,
+    file_bytes: usize,
+    keep_only_marker: bool,
+) -> Result<Seed> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     fs::create_dir(&source)?;
@@ -271,7 +335,7 @@ fn seed_layout(mebibytes: usize, pack_mib: u64, chunk_kib: u64) -> Result<Seed> 
     let backends = RepositoryBackends::new(Arc::new(backend), None);
     let config = ConfigOptions::default()
         .set_chunker(Chunker::FixedSize)
-        .set_chunk_size(ByteSize::kib(chunk_kib))
+        .set_chunk_size(ByteSize::b(chunk_bytes as u64))
         .set_datapack_size(ByteSize::mib(pack_mib))
         .set_datapack_growfactor(0)
         .set_treepack_growfactor(0)
@@ -284,10 +348,9 @@ fn seed_layout(mebibytes: usize, pack_mib: u64, chunk_kib: u64) -> Result<Seed> 
         )?
         .to_indexed_ids()?;
     let mut random = 0x0123_4567_89ab_cdef_u64;
-    let chunk_bytes = usize::try_from(chunk_kib * 1024)?;
-    let file_count = mebibytes * 1024 * 1024 / chunk_bytes;
+    let file_count = mebibytes * 1024 * 1024 / file_bytes;
     for file in 0..file_count {
-        let mut data = vec![0u8; chunk_bytes];
+        let mut data = vec![0u8; file_bytes];
         for block in data.chunks_exact_mut(8) {
             random ^= random << 13;
             random ^= random >> 7;
@@ -298,8 +361,11 @@ fn seed_layout(mebibytes: usize, pack_mib: u64, chunk_kib: u64) -> Result<Seed> 
     }
     let paths = PathList::from_iter([source.clone()]);
     let first = repo.backup(&BackupOptions::default(), &paths, SnapshotFile::default())?;
-    for file in (0..file_count).step_by(2) {
+    for file in (0..file_count).step_by(if keep_only_marker { 1 } else { 2 }) {
         fs::remove_file(source.join(format!("{file:06}")))?;
+    }
+    if keep_only_marker {
+        fs::write(source.join("retained"), vec![42u8; 1024])?;
     }
     let repo = repo.to_indexed_ids()?;
     repo.backup(&BackupOptions::default(), &paths, SnapshotFile::default())?;
@@ -626,6 +692,15 @@ fn benchmark_value(name: &str, default: u64) -> u64 {
 }
 
 fn benchmark_seed() -> Result<Seed> {
+    if std::env::var_os("PRUNE_LAB_INDEX_HEAVY").is_some() {
+        return seed_layout_bytes(
+            usize::try_from(benchmark_value("PRUNE_LAB_MIB", 64))?,
+            1,
+            64,
+            1024 * 1024,
+            true,
+        );
+    }
     seed_layout(
         usize::try_from(benchmark_value("PRUNE_LAB_MIB", 128))?,
         benchmark_value("PRUNE_LAB_PACK_MIB", 1),
@@ -674,7 +749,7 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 }
                 let (_dir, repo, backend) = trial(&seed)?;
                 let m = &backend.metrics;
-                let opts = opts(n, false)
+                let mut opts = opts(n, false)
                     .repack_read_buffer(ByteSize::mib(benchmark_value(
                         "PRUNE_LAB_READ_BUFFER_MIB",
                         128,
@@ -683,6 +758,14 @@ fn benchmark_prune_pipeline() -> Result<()> {
                         "PRUNE_LAB_UPLOAD_BUFFER_MIB",
                         256,
                     )));
+                if std::env::var_os("PRUNE_LAB_INDEX_HEAVY").is_some() {
+                    opts.max_repack = "0".parse()?;
+                    opts.instant_delete = false;
+                    if name == "latency" {
+                        m.index_delay_ms
+                            .store(benchmark_value("PRUNE_LAB_INDEX_DELAY_MS", 500), SeqCst);
+                    }
+                }
                 let plan = repo.prune_plan(&opts)?;
                 m.read_ms.store(read_ms, SeqCst);
                 m.write_ms.store(write_ms, SeqCst);
@@ -698,15 +781,24 @@ fn benchmark_prune_pipeline() -> Result<()> {
                 repo.prune(&opts, plan)?;
                 let elapsed = start.elapsed().as_secs_f64();
                 println!(
-                    "{name}-{}, {repeat}, {elapsed:.3}, {:.2}, {:.2}, {}, {}, {}, {}",
+                    "{name}-{}, {repeat}, {elapsed:.3}, {:.2}, {:.2}, {}, {}, {}, {}, {}, {}, {:.2}",
                     n.map_or_else(|| "baseline".into(), |n| n.to_string()),
                     m.read_bytes.load(SeqCst) as f64 / 1_048_576.,
                     m.write_bytes.load(SeqCst) as f64 / 1_048_576.,
                     m.peak_reads.load(SeqCst),
                     m.peak_writes.load(SeqCst),
                     m.peak.load(SeqCst),
-                    m.overlap.load(SeqCst)
+                    m.overlap.load(SeqCst),
+                    m.index_puts.load(SeqCst),
+                    m.index_peak.load(SeqCst),
+                    m.index_bytes.load(SeqCst) as f64 / 1_048_576.,
                 );
+                if std::env::var_os("PRUNE_LAB_INDEX_HEAVY").is_some() {
+                    assert!(
+                        m.index_puts.load(SeqCst) >= 5,
+                        "fixture must rebuild multiple output indexes"
+                    );
+                }
                 published_after_upload(&repo, m)?;
                 m.enabled.store(false, SeqCst);
                 repo.check(CheckOptions::default().read_data(true))?
