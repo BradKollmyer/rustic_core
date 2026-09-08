@@ -31,6 +31,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--size-mib', type=int, default=8192)
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--connections', type=int, nargs='+', choices=[5, 10], default=[5, 10])
+    parser.add_argument('--profile', action='store_true', help='Capture macOS stacks and per-process network counters in separate diagnostic trials')
     args = parser.parse_args()
     if args.size_mib <= 0 or args.repeats <= 0:
         parser.error('size and repeats must be positive')
@@ -55,7 +57,7 @@ def main():
     manifest = dict(endpoint=credentials['CEPH_FURIES_S3_ENDPOINT'], bucket=bucket,
         prefix=prefix, size_mib=args.size_mib, pack_mib=128, chunk_kib=1024,
         upload_buffer_mib=1024, read_buffer_mib=128, fd_limit=1024,
-        repeats=args.repeats, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        repeats=args.repeats, connections=args.connections, profiled=args.profile, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
     (output / 'parameters.json').write_text(json.dumps(manifest, indent=2)+'\n')
 
     def objects(root):
@@ -97,7 +99,7 @@ def main():
             seed_objects = objects(seed_prefix)
             assert len(seed_objects) == len(files)
             for repeat in range(args.repeats):
-                for n in ([5, 10] if repeat % 2 == 0 else [10, 5]):
+                for n in (args.connections if repeat % 2 == 0 else list(reversed(args.connections))):
                     trial_prefix = prefix + f'trial-{repeat}-{n}/'
                     print(f'Preparing repetition {repeat+1}, connections={n}...', flush=True)
                     def copy(obj):
@@ -112,24 +114,51 @@ def main():
                         preexec_fn=restrict_fds)
                     recording = threading.Event()
                     lines = []
+                    phase = {}
                     def read():
                         for line in proc.stdout:
                             lines.append(line)
                             if line.startswith('BEGIN '):
+                                phase['start'] = time.monotonic()
                                 recording.set()
                                 print(line.strip(), flush=True)
                             elif line.startswith('RESULT '):
+                                phase['end'] = time.monotonic()
                                 recording.clear()
                                 print(line.strip(), flush=True)
                     reader = threading.Thread(target=read)
                     reader.start()
                     samples = []
                     start = time.monotonic()
+                    profiles = []
+                    net = None
+                    net_files = []
+                    network_segments = []
                     try:
                         while proc.poll() is None:
                             if time.monotonic()-start > 1200:
                                 raise TimeoutError('S3 trial exceeded 20 minutes')
                             if recording.is_set():
+                                if args.profile:
+                                    if net is None or net.poll() is not None:
+                                        for stream in net_files:
+                                            stream.close()
+                                        index = len(network_segments)
+                                        network_path = output/f'trial-{repeat}-{n}-network-{index}.csv'
+                                        network_segments.append(dict(file=network_path.name,
+                                            launch_seconds_into_prune=time.monotonic()-phase['start']))
+                                        net_files = [network_path.open('w'), network_path.with_suffix('.stderr').open('w')]
+                                        # Finite captures flush stdio on exit; killing an infinite
+                                        # nettop capture can discard its final buffered records.
+                                        net = subprocess.Popen(['/usr/bin/nettop', '-P', '-n', '-x', '-L', '6', '-s', '1',
+                                                                '-p', str(proc.pid), '-J', 'bytes_in,bytes_out'],
+                                                               stdout=net_files[0], stderr=net_files[1])
+                                    if len(profiles) < 3 and time.monotonic()-phase['start'] >= 5+20*len(profiles):
+                                        path = output/f'trial-{repeat}-{n}-profile-{len(profiles)}.sample.txt'
+                                        sampler_log = path.with_suffix('.stderr').open('w')
+                                        sampler = subprocess.Popen(['/usr/bin/sample', str(proc.pid), '5', '1', '-file', str(path)],
+                                                                   stdout=sampler_log, stderr=sampler_log)
+                                        profiles.append((sampler, sampler_log, time.monotonic(), path))
                                 rss = subprocess.run(['ps', '-o', 'rss=,pcpu=', '-p', str(proc.pid)], capture_output=True, text=True)
                                 fd = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(proc.pid), '-d', '0-1048575', '-Ff'],
                                                     capture_output=True, text=True)
@@ -143,6 +172,29 @@ def main():
                             proc.kill()
                         reader.join()
                         proc.wait()
+                        if net is not None:
+                            try:
+                                net.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                net.kill()
+                                net.wait()
+                            for stream in net_files:
+                                stream.close()
+                        windows = []
+                        for sampler, stream, launched, path in profiles:
+                            try:
+                                code = sampler.wait(timeout=30)
+                            except subprocess.TimeoutExpired:
+                                sampler.kill()
+                                sampler.wait()
+                                code = -1
+                            stream.close()
+                            windows.append(dict(file=path.name, exit_code=code,
+                                launch_seconds_into_prune=launched-phase['start'],
+                                prune_end_seconds=phase.get('end', time.monotonic())-phase['start']))
+                        if args.profile:
+                            (output/f'trial-{repeat}-{n}-network-windows.json').write_text(json.dumps(dict(segments=network_segments, prune_end_seconds=phase.get('end', time.monotonic())-phase.get('start', start)), indent=2)+'\n')
+                            (output/f'trial-{repeat}-{n}-profile-windows.json').write_text(json.dumps(windows, indent=2)+'\n')
                         (output/f'trial-{repeat}-{n}.log').write_text(''.join(lines))
                         (output/f'trial-{repeat}-{n}-samples.json').write_text(json.dumps(samples, indent=2)+'\n')
                     if proc.returncode or 'CHECK passed\n' not in lines:
@@ -162,7 +214,7 @@ def main():
             (output/'cleanup.json').write_text(json.dumps({'prefix': prefix, 'empty': True})+'\n')
     summary = {n: {field: statistics.median(r[field] for r in results if r['connections'] == n)
                    for field in ['seconds', 'write_mibps', 'peak_rss_mib', 'peak_fds']
-                   if all(r[field] is not None for r in results if r['connections'] == n)} for n in [5, 10]}
+                   if all(r[field] is not None for r in results if r['connections'] == n)} for n in args.connections}
     (output/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     print(json.dumps(summary), flush=True)
 
