@@ -11,7 +11,7 @@ use rustic_core::{
     repofile::{Chunker, IndexFile, MasterKey, SnapshotFile},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     sync::{
@@ -160,7 +160,7 @@ fn transfer_delay(milliseconds: u64, bytes: u64, mib_per_second: u64) -> Duratio
 
 #[derive(Clone)]
 struct DelayedBackend {
-    inner: LocalBackend,
+    inner: Arc<dyn WriteBackend>,
     metrics: Arc<Metrics>,
 }
 impl ReadBackend for DelayedBackend {
@@ -418,7 +418,7 @@ fn trial(seed: &Seed) -> Result<(TempDir, Repository<OpenStatus>, DelayedBackend
     copy_dir(&seed.dir.path().join("repo"), dir.path())?;
     let metrics = Arc::new(Metrics::default());
     let backend = DelayedBackend {
-        inner: LocalBackend::new(dir.path().to_str().unwrap(), None)?,
+        inner: Arc::new(LocalBackend::new(dir.path().to_str().unwrap(), None)?),
         metrics,
     };
     *backend.metrics.completed.lock().unwrap() =
@@ -1047,5 +1047,91 @@ fn undersized_pack_budget_fails_before_prune_mutation() -> Result<()> {
     assert_eq!(m.puts.load(SeqCst), 0);
     assert_eq!(m.index_puts.load(SeqCst), 0);
     assert_eq!(m.deletes.load(SeqCst), 0);
+    Ok(())
+}
+
+struct BenchmarkLogger;
+impl log::Log for BenchmarkLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+/// Explicit opt-in only: the runner seeds and cleans this dedicated S3 prefix.
+#[test]
+#[ignore = "requires a disposable Ceph S3 fixture; use scripts/benchmark-prune-s3.py"]
+#[allow(clippy::cast_precision_loss)]
+fn benchmark_prune_s3() -> Result<()> {
+    static LOGGER: BenchmarkLogger = BenchmarkLogger;
+    log::set_logger(&LOGGER)?;
+    log::set_max_level(log::LevelFilter::Warn);
+    let root = std::env::var("PRUNE_S3_ROOT")?;
+    let bucket = std::env::var("CEPH_FURIES_S3_BUCKET")?;
+    anyhow::ensure!(bucket == "rustic-prune-bench" && root.starts_with("bench-"));
+    let mut options = BTreeMap::from([
+        ("root".into(), root),
+        ("bucket".into(), bucket),
+        ("endpoint".into(), std::env::var("CEPH_FURIES_S3_ENDPOINT")?),
+        ("region".into(), std::env::var("CEPH_FURIES_S3_REGION")?),
+        (
+            "access_key_id".into(),
+            std::env::var("CEPH_FURIES_S3_ACCESS_KEY_ID")?,
+        ),
+        (
+            "secret_access_key".into(),
+            std::env::var("CEPH_FURIES_S3_SECRET_ACCESS_KEY")?,
+        ),
+    ]);
+    // Explicit credentials only; never fall back to a host instance role.
+    options.insert("disable_ec2_metadata".into(), "true".into());
+    let backend = DelayedBackend {
+        inner: Arc::new(rustic_backend::OpenDALBackend::new("s3", options)?),
+        metrics: Arc::new(Metrics::default()),
+    };
+    *backend.metrics.completed.lock().unwrap() =
+        backend.list(FileType::Pack)?.into_iter().collect();
+    let key: MasterKey = serde_json::from_slice(&fs::read(std::env::var("PRUNE_S3_KEY_FILE")?)?)?;
+    let backends = RepositoryBackends::new(Arc::new(backend.clone()), None);
+    let cache = tempdir()?;
+    let repo = Repository::new(
+        &RepositoryOptions::default().cache_dir(cache.path()),
+        &backends,
+    )?
+    .open(&Credentials::Masterkey(key))?;
+    let n = usize::try_from(benchmark_value("PRUNE_S3_CONNECTIONS", 5))?;
+    let options = opts(Some(n), true)
+        .parallel_repack(true)
+        .repack_read_buffer(ByteSize::mib(128))
+        .repack_upload_buffer(ByteSize::gib(1));
+    let plan = repo.prune_plan(&options)?;
+    let m = &backend.metrics;
+    m.enabled.store(true, SeqCst);
+    println!("BEGIN s3-{n}");
+    let start = Instant::now();
+    repo.prune(&options, plan)?;
+    let seconds = start.elapsed().as_secs_f64();
+    m.enabled.store(false, SeqCst);
+    println!(
+        "RESULT {}",
+        serde_json::json!({
+            "connections": n, "seconds": seconds,
+            "read_mib": m.read_bytes.load(SeqCst) as f64 / 1_048_576.,
+            "write_mib": m.write_bytes.load(SeqCst) as f64 / 1_048_576.,
+            "peak_get": m.peak_reads.load(SeqCst), "peak_put": m.peak_writes.load(SeqCst),
+            "peak_io": m.peak.load(SeqCst), "overlap": m.overlap.load(SeqCst),
+            "index_puts": m.index_puts.load(SeqCst),
+        })
+    );
+    assert!(m.peak.load(SeqCst) <= n);
+    published_after_upload(&repo, m)?;
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    println!("CHECK passed");
     Ok(())
 }
