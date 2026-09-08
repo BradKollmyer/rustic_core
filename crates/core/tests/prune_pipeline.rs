@@ -1395,3 +1395,104 @@ fn parallel_backup_failures_do_not_publish_snapshots() -> Result<()> {
     }
     Ok(())
 }
+
+/// Compare restore connection limits against one unchanged S3 fixture.
+#[test]
+#[ignore = "requires a disposable S3 prefix; use scripts/benchmark-restore-s3.py"]
+#[allow(clippy::cast_precision_loss)]
+fn benchmark_restore_s3() -> Result<()> {
+    static LOGGER: BenchmarkLogger = BenchmarkLogger;
+    log::set_logger(&LOGGER)?;
+    log::set_max_level(log::LevelFilter::Warn);
+    let scratch = tempdir()?;
+    let source = scratch.path().join("source");
+    fs::create_dir(&source)?;
+    let size_mib = benchmark_value("RESTORE_S3_MIB", 4096);
+    anyhow::ensure!(size_mib >= 64 && size_mib.is_multiple_of(64));
+    let file_count = size_mib / 16;
+    let mut random = 0x0123_4567_89ab_cdef_u64;
+    for file in 0..file_count {
+        backup_benchmark_file(
+            &source.join(format!("{file:06}")),
+            16 * 1024 * 1024,
+            &mut random,
+        )?;
+    }
+    let key = MasterKey::new();
+    let backend = benchmark_s3_backend(Some(5))?;
+    anyhow::ensure!(backend.list(FileType::Pack)?.is_empty());
+    let backends = RepositoryBackends::new(Arc::new(backend), None);
+    let repo = Repository::new(&RepositoryOptions::default().no_cache(true), &backends)?
+        .init(
+            &Credentials::Masterkey(key.clone()),
+            &KeyOptions::default(),
+            &ConfigOptions::default()
+                .set_datapack_size(ByteSize::mib(128))
+                .set_datapack_growfactor(0)
+                .set_treepack_growfactor(0)
+                .set_compression(1),
+        )?
+        .to_indexed_ids()?;
+    println!("SETUP uploading source fixture");
+    let snapshot = repo.backup(
+        &BackupOptions::default().as_path(Path::new("source").to_path_buf()),
+        &PathList::from_iter([source.clone()]),
+        SnapshotFile::default(),
+    )?;
+    assert_eq!(snapshot.summary.as_ref().unwrap().error_count, 0);
+    repo.drop_index()
+        .check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    println!("SETUP fixture full check passed");
+    for (trial, connections) in [5, 10, 10, 5].into_iter().enumerate() {
+        let cache = tempdir()?;
+        let restored = tempdir()?;
+        let backend = benchmark_s3_backend(Some(connections))?;
+        let m = &backend.metrics;
+        let backends = RepositoryBackends::new(Arc::new(backend.clone()), None);
+        let destination =
+            rustic_core::LocalDestination::new(restored.path().to_str().unwrap(), true, false)?;
+        let restore_options = rustic_core::RestoreOptions::default();
+        let ls_options = rustic_core::LsOptions::default();
+        let stage = format!("{connections}-{}", trial + 1);
+        m.enabled.store(true, SeqCst);
+        println!("BEGIN restore-{stage}");
+        let start = Instant::now();
+        let repo = Repository::new(
+            &RepositoryOptions::default().cache_dir(cache.path()),
+            &backends,
+        )?
+        .open(&Credentials::Masterkey(key.clone()))?
+        .to_indexed()?;
+        let node = repo.node_from_snapshot_and_path(&snapshot, "source")?;
+        let ls = repo.ls(&node, &ls_options)?;
+        let plan = repo.prepare_restore(&restore_options, ls.clone(), &destination, false)?;
+        let prepare_seconds = start.elapsed().as_secs_f64();
+        let transfer = Instant::now();
+        repo.restore(plan, &restore_options, ls, &destination)?;
+        let transfer_seconds = transfer.elapsed().as_secs_f64();
+        let seconds = start.elapsed().as_secs_f64();
+        m.enabled.store(false, SeqCst);
+        println!(
+            "RESULT {}",
+            serde_json::json!({
+                "stage":stage, "connections": connections, "source_mib":size_mib,
+                "seconds":seconds, "prepare_seconds":prepare_seconds,
+                "transfer_seconds":transfer_seconds,
+                "range_gets":m.gets.load(SeqCst), "range_read_mib":m.read_bytes.load(SeqCst) as f64 / 1_048_576.,
+                "peak_logical_reads":m.peak_reads.load(SeqCst),
+                "peak_live_range_mib":m.peak_read_bytes.load(SeqCst) as f64 / 1_048_576.,
+            })
+        );
+        assert_eq!(fs::read_dir(restored.path())?.count() as u64, file_count);
+        for file in 0..file_count {
+            let name = format!("{file:06}");
+            assert!(
+                fs::read(source.join(&name))? == fs::read(restored.path().join(&name))?,
+                "restored bytes differ for {name}"
+            );
+        }
+        println!("CHECK {stage} passed (byte-for-byte restore)");
+    }
+    Ok(())
+}
