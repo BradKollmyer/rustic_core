@@ -1496,3 +1496,42 @@ fn benchmark_restore_s3() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn repeated_prune_waits_for_marked_packs_without_repacking_live_data() -> Result<()> {
+    let seed = seed(32)?;
+    let (_dir, repo, backend) = trial(&seed)?;
+    let options = PruneOptions::default()
+        .max_repack(LimitOption::Unlimited)
+        .max_unused(LimitOption::Percentage(10))
+        .no_resize(true)
+        .fast_repack(true);
+    let plan = repo.prune_plan(&options)?;
+    assert!(plan.stats.packs.repack > 0);
+    repo.prune(&options, plan)?;
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    let packs_before: BTreeSet<_> = backend.list(FileType::Pack)?.into_iter().collect();
+    let plan = repo.prune_plan(&options)?;
+    assert!(plan.stats.packs_to_delete.keep > 0);
+    assert_eq!(plan.stats.packs_to_delete.remove, 0);
+    assert_eq!(plan.stats.packs.repack, 0);
+    repo.prune(&options, plan)?;
+    assert_eq!(
+        backend
+            .list(FileType::Pack)?
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        packs_before
+    );
+    // Expire the deletion delay only in this isolated fixture, then verify cleanup.
+    let options = options.keep_delete(jiff::Span::new());
+    let plan = repo.prune_plan(&options)?;
+    assert!(plan.stats.packs_to_delete.remove > 0);
+    assert_eq!(plan.stats.packs.repack, 0);
+    repo.prune(&options, plan)?;
+    assert!(backend.list(FileType::Pack)?.len() < packs_before.len());
+    repo.check(CheckOptions::default().read_data(true))?
+        .is_ok()?;
+    Ok(())
+}

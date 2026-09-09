@@ -753,6 +753,9 @@ pub struct PrunePlan {
     repack_candidates: Vec<(PackInfo, EnumSet<PackStatus>, RepackReason, usize, usize)>,
     /// The index files
     index_files: Vec<PruneIndex>,
+    /// Unneeded blob bytes in already-marked packs, including those still aging out.
+    /// Report these bytes, but exclude them from compaction limits.
+    unused_marked_size: u64,
     /// `prune` statistics
     pub stats: PruneStats,
 }
@@ -828,6 +831,7 @@ impl PrunePlan {
             existing_packs,
             repack_candidates: Vec::new(),
             index_files,
+            unused_marked_size: 0,
             stats: PruneStats::default(),
         }
     }
@@ -1103,6 +1107,7 @@ impl PrunePlan {
                             }
                         }
                         (true, 0, _) => {
+                            self.unused_marked_size += u64::from(pi.unused_size);
                             _ = status.insert(PackStatus::Marked);
                             match pack.time {
                                 // unneeded and marked pack => check if we can remove it.
@@ -1167,6 +1172,8 @@ impl PrunePlan {
         no_resize: bool,
         pack_sizer: &BlobTypeMap<PackSizer>,
     ) {
+        let mut active_size = self.stats.size_sum();
+        active_size.unused -= self.unused_marked_size;
         let max_unused = match (repack_uncompressed, max_unused) {
             (true, _) => 0,
             (false, LimitOption::Unlimited) => u64::MAX,
@@ -1174,13 +1181,13 @@ impl PrunePlan {
             // if percentag is given, we want to have
             // unused <= p/100 * size_after = p/100 * (size_used + unused)
             // which equals (1 - p/100) * unused <= p/100 * size_used
-            (false, LimitOption::Percentage(p)) => (p * self.stats.size_sum().used) / (100 - p),
+            (false, LimitOption::Percentage(p)) => (p * active_size.used) / (100 - p),
         };
 
         let max_repack = match max_repack {
             LimitOption::Unlimited => u64::MAX,
             LimitOption::Size(size) => size.as_u64(),
-            LimitOption::Percentage(p) => (p * self.stats.size_sum().total()) / 100,
+            LimitOption::Percentage(p) => (p * active_size.total()) / 100,
         };
 
         self.repack_candidates.sort_unstable_by_key(|rc| rc.0);
@@ -1196,7 +1203,8 @@ impl PrunePlan {
 
             let total_repack_size: u64 = repack_size.into_values().sum();
             if total_repack_size + u64::from(pi.used_size) >= max_repack
-                || (self.stats.size_sum().unused_after_prune() < max_unused
+                || (self.stats.size_sum().unused_after_prune() - self.unused_marked_size
+                    < max_unused
                     && repack_reason == RepackReason::PartlyUsed
                     && blob_type == BlobType::Data)
                 || (repack_reason == RepackReason::SizeMismatch && no_resize)
@@ -2039,5 +2047,133 @@ mod concurrency_cli_tests {
             explicit.effective_repack_connections(Some(5)).unwrap(),
             Some(5)
         );
+    }
+}
+
+#[cfg(test)]
+mod marked_pack_compaction_tests {
+    use super::*;
+
+    fn pack(used: u32, unused: u32, time: Option<Timestamp>) -> (IndexPack, Vec<UsedId>) {
+        let mut pack = IndexPack {
+            id: PackId::from(crate::Id::random()),
+            time,
+            ..IndexPack::default()
+        };
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        for (length, needed) in [(used, true), (unused, false)] {
+            if length > 0 {
+                let id = BlobId::from(crate::Id::random());
+                pack.add(id, BlobType::Data, offset, length, None);
+                offset += length;
+                if needed {
+                    ids.push(UsedId(id));
+                }
+            }
+        }
+        (pack, ids)
+    }
+
+    fn plan(
+        active: (u32, u32),
+        marked: (u32, u32),
+        time: Option<Timestamp>,
+        opts: &PruneOptions,
+    ) -> PrunePlan {
+        let (active, used_active) = pack(active.0, active.1, None);
+        let (marked, used_marked) = pack(marked.0, marked.1, time);
+        let index = IndexFile {
+            packs: vec![active],
+            packs_to_delete: vec![marked],
+            ..IndexFile::default()
+        };
+        let mut plan = PrunePlan::new(
+            UsedIdMap::from_lists(vec![used_active, used_marked]),
+            BTreeMap::new(),
+            vec![(IndexId::from(crate::Id::random()), index)],
+        );
+        let sizes = enum_map::enum_map! { _ => PackSizer::fixed(1000) };
+        plan.count_used_blobs();
+        plan.check().unwrap();
+        plan.decide_packs(
+            Span::new(),
+            Span::new().hours(23),
+            false,
+            opts.repack_uncompressed,
+            opts.repack_all,
+            &sizes,
+        )
+        .unwrap();
+        plan.decide_repack(
+            &opts.max_repack,
+            &opts.max_unused,
+            opts.repack_uncompressed || opts.repack_all,
+            true,
+            &sizes,
+        );
+        plan
+    }
+
+    #[test]
+    fn pending_expired_and_undated_marked_packs_do_not_force_compaction() {
+        let now = Timestamp::now();
+        for (time, expected) in [
+            (Some(now), PackToDo::KeepMarked),
+            (
+                Some(now.checked_sub(Span::new().hours(25)).unwrap()),
+                PackToDo::Delete,
+            ),
+            (None, PackToDo::KeepMarkedAndCorrect),
+        ] {
+            for max_unused in [
+                LimitOption::Percentage(5),
+                LimitOption::Size(ByteSize::b(50)),
+            ] {
+                let opts = PruneOptions::default()
+                    .max_repack(LimitOption::Unlimited)
+                    .max_unused(max_unused);
+                let plan = plan((1000, 10), (0, 2000), time, &opts);
+                assert_eq!(plan.stats.packs.repack, 0);
+                assert_eq!(plan.index_files[0].packs[1].to_do, expected);
+                // Reporting still includes the old copies awaiting physical deletion.
+                assert_eq!(plan.stats.size_sum().unused_after_prune(), 2010);
+                assert_eq!(plan.stats.packs_to_delete.total(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn marked_bytes_do_not_inflate_percentage_repack_cap() {
+        let opts = PruneOptions::default().max_unused(LimitOption::Percentage(0));
+        let plan = plan((100, 100), (0, 2000), Some(Timestamp::now()), &opts);
+        assert_eq!(plan.stats.packs.repack, 0); // 10% of 200 cannot rewrite 100.
+        let opts = opts.max_repack(LimitOption::Size(ByteSize::b(101)));
+        assert_eq!(
+            self::plan((100, 100), (0, 2000), Some(Timestamp::now()), &opts)
+                .stats
+                .packs
+                .repack,
+            1
+        );
+    }
+
+    #[test]
+    fn active_waste_recovered_packs_and_explicit_repacking_still_count() {
+        let opts = PruneOptions::default().max_repack(LimitOption::Unlimited);
+        let now = Some(Timestamp::now());
+        assert_eq!(
+            plan((1000, 100), (0, 2000), now, &opts).stats.packs.repack,
+            1
+        );
+        let recovered = plan((1000, 10), (100, 2000), now, &opts);
+        assert_eq!(recovered.stats.packs_to_delete.recover, 1);
+        assert_eq!(recovered.stats.packs.repack, 1);
+        for opts in [
+            opts.clone().repack_all(true),
+            opts.repack_uncompressed(true),
+        ] {
+            assert_eq!(plan((1000, 0), (0, 2000), now, &opts).stats.packs.repack, 1);
+        }
     }
 }
