@@ -13,6 +13,7 @@ use crate::{
     CommandInput, Excludes, ReadSource,
     archiver::{Archiver, parent::Parent},
     backend::{
+        ReadBackend,
         childstdout::ChildStdoutSource,
         dry_run::DryRunBackend,
         ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
@@ -149,13 +150,18 @@ impl ParentOptions {
 #[non_exhaustive]
 /// Options for the `backup` command.
 pub struct BackupOptions {
-    /// Upload backup packs in parallel, using up to five workers and the backend connection limit.
+    /// Upload backup packs in parallel. Default worker count is the backend connection limit, or 5.
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub parallel_uploads: bool,
 
+    /// Parallel backup upload workers. Implies `--parallel-uploads`. Capped by the backend connection limit when set.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "N"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    pub backup_connections: Option<usize>,
+
     /// Limit completed parallel backup pack buffers (default: 1 GiB). Small buffers reduce concurrency.
-    #[cfg_attr(feature = "clap", clap(long, requires = "parallel_uploads"))]
+    #[cfg_attr(feature = "clap", clap(long, value_name = "SIZE"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub backup_upload_buffer: Option<bytesize::ByteSize>,
@@ -207,6 +213,27 @@ pub struct BackupOptions {
     #[serde(flatten)]
     /// Options how to filter from a local source
     pub ignore_filter_opts: LocalSourceFilterOptions,
+}
+
+impl BackupOptions {
+    fn effective_backup_connections(
+        &self,
+        backend_limit: Option<usize>,
+    ) -> RusticResult<Option<usize>> {
+        if !self.parallel_uploads && self.backup_connections.is_none() {
+            return Ok(None);
+        }
+        let requested = self.backup_connections.or(backend_limit).unwrap_or(5);
+        let effective = backend_limit.map_or(requested, |limit| requested.min(limit));
+        if effective < 1 {
+            return Err(RusticError::new(
+                ErrorKind::InvalidInput,
+                "Parallel backup needs at least one upload worker.",
+            )
+            .attach_context("connections", effective.to_string()));
+        }
+        Ok(Some(effective))
+    }
 }
 
 /// Backup data, create a snapshot.
@@ -296,12 +323,20 @@ where
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
     info!("starting to backup {backup_paths:?} ...");
-    let upload_bytes = opts.parallel_uploads.then(|| {
-        opts.backup_upload_buffer
-            .unwrap_or(bytesize::ByteSize::gib(1))
-            .as_u64()
-    });
-    let archiver = Archiver::new(be, index, repo.config(), parent, snap, upload_bytes)?;
+    let upload = opts
+        .effective_backup_connections(be.connection_limit())?
+        .map(|n| {
+            (
+                n,
+                opts.backup_upload_buffer
+                    .unwrap_or(bytesize::ByteSize::gib(1))
+                    .as_u64(),
+            )
+        });
+    if let Some((n, _)) = upload {
+        info!("using {n} parallel upload workers");
+    }
+    let archiver = Archiver::new(be, index, repo.config(), parent, snap, upload)?;
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(
@@ -373,4 +408,44 @@ pub(crate) fn backup<S: IndexedIds>(
     };
 
     Ok(snap)
+}
+
+#[cfg(test)]
+mod backup_connections_tests {
+    use super::*;
+
+    #[test]
+    fn serial_by_default() {
+        assert_eq!(
+            BackupOptions::default()
+                .effective_backup_connections(Some(10))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parallel_uploads_uses_backend_or_five() {
+        let opts = BackupOptions::default().parallel_uploads(true);
+        assert_eq!(opts.effective_backup_connections(None).unwrap(), Some(5));
+        assert_eq!(
+            opts.effective_backup_connections(Some(10)).unwrap(),
+            Some(10)
+        );
+        assert_eq!(opts.effective_backup_connections(Some(3)).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn backup_connections_implies_parallel_and_caps_at_backend() {
+        let opts = BackupOptions::default().backup_connections(Some(10));
+        assert_eq!(opts.effective_backup_connections(None).unwrap(), Some(10));
+        assert_eq!(opts.effective_backup_connections(Some(5)).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn backup_connections_zero_is_invalid() {
+        let opts = BackupOptions::default().backup_connections(Some(0));
+        assert!(opts.effective_backup_connections(None).is_err());
+        assert!(opts.effective_backup_connections(Some(5)).is_err());
+    }
 }

@@ -86,6 +86,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * `config` - The config file.
     /// * `parent` - The parent snapshot to use.
     /// * `snap` - The `SnapshotFile` to write to.
+    /// * `upload` - Parallel upload workers and completed-pack byte budget, if enabled.
     ///
     /// # Errors
     ///
@@ -97,14 +98,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         config: &ConfigFile,
         parent: Parent,
         mut snap: SnapshotFile,
-        upload_bytes: Option<u64>,
+        upload: Option<(usize, u64)>,
     ) -> RusticResult<Self> {
         let indexer = Indexer::new(be.clone()).into_shared();
         let mut summary = snap.summary.take().unwrap_or_default();
         summary.backup_start = Zoned::now();
 
-        let uploads = upload_bytes
-            .map(|bytes| -> RusticResult<_> {
+        let uploads = upload
+            .map(|(n, bytes)| -> RusticResult<_> {
                 // Validate before reading source files. The runtime byte permit also covers
                 // growth and the final blob/header that can exceed the current pack target.
                 let required = [BlobType::Data, BlobType::Tree]
@@ -125,7 +126,6 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     .attach_context("required_bytes", required.to_string())
                     .attach_context("budget_bytes", bytes.to_string()));
                 }
-                let n = be.connection_limit().unwrap_or(5).clamp(1, 5);
                 let buffers = RepackBuffers {
                     reads: ByteBudget::new(0, "unused backup reads"),
                     uploads: ByteBudget::new(bytes, "--backup-upload-buffer"),

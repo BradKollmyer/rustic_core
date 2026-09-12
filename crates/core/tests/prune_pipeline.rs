@@ -1350,6 +1350,44 @@ fn parallel_backup_uploads_are_bounded_and_restore() -> Result<()> {
 }
 
 #[test]
+fn backup_connections_caps_workers_below_backend_limit() -> Result<()> {
+    let seed = seed(2)?;
+    let source = tempdir()?;
+    let mut random = 123_u64;
+    for file in 0..2 {
+        backup_benchmark_file(
+            &source.path().join(format!("{file:06}")),
+            16 * 1024 * 1024,
+            &mut random,
+        )?;
+    }
+    let (_dir, repo, backend) = trial(&seed)?;
+    let m = &backend.metrics;
+    m.connection_limit.store(5, SeqCst);
+    m.write_ms.store(50, SeqCst);
+    m.enabled.store(true, SeqCst);
+    let repo = repo.to_indexed_ids()?;
+    let snapshot = repo.backup(
+        &BackupOptions::default()
+            .backup_connections(Some(2))
+            .backup_upload_buffer(Some(ByteSize::mib(8)))
+            .as_path(Path::new("source").to_path_buf()),
+        &PathList::from_iter([source.path().to_path_buf()]),
+        SnapshotFile::default(),
+    )?;
+    assert_eq!(snapshot.summary.as_ref().unwrap().error_count, 0);
+    let peak = m.peak_data_writes.load(SeqCst);
+    assert!(peak <= 2);
+    assert!(peak > 1);
+    assert_eq!(m.active.load(SeqCst), 0);
+    let repo = repo.drop_index();
+    published_after_upload(&repo, m)?;
+    m.enabled.store(false, SeqCst);
+    verify_s3_backup(repo, &snapshot, source.path(), 2)?;
+    Ok(())
+}
+
+#[test]
 fn parallel_backup_failures_do_not_publish_snapshots() -> Result<()> {
     let seed = seed(2)?;
     let source = tempdir()?;
