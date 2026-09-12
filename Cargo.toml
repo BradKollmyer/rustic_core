@@ -8,9 +8,9 @@ members = [
 ]
 resolver = "3"
 
-# Pin retry classification, QUIC, and Noise until a crates.io release includes them.
+# Pin retry classification, QUIC, Noise, and SN pool until a crates.io release includes them.
 [patch.crates-io]
-storj = { git = "https://github.com/BradKollmyer/storj-uplink.git", rev = "948bc1922e3820df97f4995a40f4d8cedbde11c1" }
+storj = { git = "https://github.com/BradKollmyer/storj-uplink.git", rev = "a30a672c140ade0b1c0291fa92ad046001c26d01" }
 
 [workspace.package]
 rust-version = "1.91.0"
