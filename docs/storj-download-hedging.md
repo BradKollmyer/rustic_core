@@ -39,7 +39,7 @@ and rustic_core pin that Git revision. The CLI also pins the corresponding
 rustic_core implementation so builds do not depend on local checkout paths.
 The prior concurrency and timeout fixes are included in rustic_core.
 
-The built CLI is `../rustic/target-darwin-dbg/release/rustic`, stamped
+The benchmark CLI is `../rustic/target-darwin-dbg/release/rustic`, stamped
 `v0.11.4-15-g9993998+storj-8d9eaa7-hedge+core-14f2aad-dirty`.
 
 ```sh
@@ -47,7 +47,7 @@ cd ../rustic
 CARGO_PROFILE_RELEASE_LTO=false \
 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
 CARGO_TARGET_DIR=target-darwin-dbg \
-PROJECT_VERSION=v0.11.4-15-g9993998+storj-8d9eaa7-hedge+core-14f2aad-dirty \
+PROJECT_VERSION="$(git describe --tags --always)+storj-e635fba+core-acd990e" \
 cargo build --locked --release --features release --bin rustic
 ```
 
@@ -100,5 +100,47 @@ file or network condition. Speculative-transfer bytes were not measured.
 Raw logs, profiles, restored copies and the original binary
 are in `/private/tmp/rustic-storj-perf.S9fUcA/`.
 
-This is a single-file benchmark. A complete 14 GiB restore and deployment to arc
-have not been performed with the updated SDK.
+## Full-day restore, 2026-09-12
+
+The complete `2026-08-31` photo directory was restored from snapshot `59bff332`
+on the same Mac, with the default one-second hedge delay, five object connections
+and a 20-second message timeout. The destination was new; the run did not reuse
+existing restored files. It used a warm metadata cache, `--no-ownership`, and
+`ulimit -n 8192`.
+
+| | Earlier native run | Native with hedging |
+|---|---:|---:|
+| Files | 814 | 814 |
+| Logical bytes | 15,107,783,814 | 15,107,783,814 |
+| Wall time | 4,748 s (79.13 min) | 1,151.26 s (19.19 min) |
+| Payload throughput | 3.03 MiB/s | 12.51 MiB/s |
+| Exit status | 0 | 0 |
+
+The full restore was **4.12× faster**, saving **59.95 minutes**. File-content
+restoration took 1,149.79 seconds; metadata took 178 ms. After completion,
+`diff -rq` compared all 814 files against the earlier restored directory and
+exited 0 with no differences. Both directories contain exactly 15,107,783,814
+bytes (14.07 GiB). This verifies file contents, not ownership metadata.
+
+The baseline is the earlier 07:06:48–08:25:56 UTC run recorded in
+`/Users/bradk/photos-restore/perf/restore-wrapper.log`; it is not a simultaneous
+control. The updated restore finished at 20:43:59 UTC. Git/Cargo dependency checks
+ran during its first few minutes. Network conditions can vary between runs.
+
+```sh
+ulimit -n 8192
+/usr/bin/time -p ./target-darwin-dbg/release/rustic \
+  -P /private/tmp/rustic-storj-perf.S9fUcA/native \
+  restore 59bff332:/var/mnt/photos/2026-08-31 \
+  /Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/2026-08-31 \
+  --no-ownership \
+  --log-file /Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/full-day.log
+
+diff -rq /Users/bradk/photos-restore/2026-08-31 \
+  /Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/2026-08-31
+```
+
+The command above records this run; use a fresh destination for another timing.
+The restored files and full log remain under
+`/Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/`.
+The updated SDK has not been deployed to arc.
