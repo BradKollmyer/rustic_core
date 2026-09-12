@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+#[cfg(not(test))]
+use std::mem::size_of;
 
 use rayon::prelude::*;
 
@@ -25,9 +27,26 @@ pub(crate) struct SortedEntry {
 /// Max entries in one collector chunk.
 ///
 /// Growing a single `Vec` of blob ids doubles it. On a large repo that request
-/// is hundreds of MiB while the old buffer is still live, and musl aborts:
-/// `memory allocation of N bytes failed`. Chunks cap each allocation.
-const ENTRY_CHUNK_LEN: usize = if cfg!(test) { 4 } else { 1 << 20 };
+/// is hundreds of MiB while the old buffer is still live, and the allocator
+/// aborts: `memory allocation of N bytes failed`. Chunks cap each allocation.
+///
+/// 64-bit: 1 Mi entries → 48 MiB per `SortedEntry` chunk (32 MiB per `BlobId`).
+/// 32-bit: 64 Ki entries → 3 MiB / 2 MiB. openzwave (armv7) still OOM'd on 48 MiB.
+const ENTRY_CHUNK_LEN: usize = if cfg!(test) {
+    4
+} else if cfg!(target_pointer_width = "32") {
+    1 << 16
+} else {
+    1 << 20
+};
+
+#[cfg(not(test))]
+const _: () = {
+    assert!(size_of::<SortedEntry>() == 48);
+    assert!(ENTRY_CHUNK_LEN * size_of::<SortedEntry>() <= 48 * 1024 * 1024);
+    #[cfg(target_pointer_width = "32")]
+    assert!(ENTRY_CHUNK_LEN * size_of::<SortedEntry>() <= 4 * 1024 * 1024);
+};
 
 /// Append-only vec of bounded chunks. Lookups binary-search every chunk.
 /// With K chunks of at most C entries, a miss costs O(K log C), rather than
