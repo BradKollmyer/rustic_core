@@ -14,7 +14,9 @@ use pariter::IteratorExt;
 use crate::{
     Progress,
     archiver::{
-        file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
+        file_archiver::{FileArchiver, UploadStats},
+        parent::Parent,
+        tree::TreeIterator,
         tree_archiver::TreeArchiver,
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
@@ -173,12 +175,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * `as_path` - The path to archive the backup as.
     /// * `skip_identical_parent` - skip saving of snapshot if tree is identical to parent tree.
     /// * `p` - The progress bar.
+    /// * `p_upload` - Live new/changed file counts and unique bytes.
     ///
     /// # Errors
     ///
     /// * If sending the message to the raw packer fails.
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
+    #[allow(clippy::too_many_arguments)]
     pub fn archive<R>(
         mut self,
         src: &R,
@@ -187,6 +191,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         skip_identical_parent: bool,
         no_scan: bool,
         p: &Progress,
+        p_upload: &Progress,
     ) -> RusticResult<SnapshotFile>
     where
         R: ReadSource + 'static,
@@ -194,6 +199,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         <R as ReadSource>::Iter: Send,
     {
         let error_count = AtomicU64::new(0);
+        let upload = UploadStats::new(p_upload.clone());
 
         let archived = scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
@@ -249,7 +255,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 },
             )
             // archive files in parallel
-            .parallel_map_scoped(s, |item| self.file_archiver.process(item, p))
+            .parallel_map_scoped(s, |item| self.file_archiver.process(item, p, &upload))
             .readahead_scoped(s)
             .filter_map(|item| match item {
                 Ok(item) => Some(item),
@@ -292,6 +298,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         }
 
         p.finish();
+        upload.finish();
         Ok(self.snap)
     }
 }

@@ -338,7 +338,7 @@ where
     }
     let archiver = Archiver::new(be, index, repo.config(), parent, snap, upload)?;
     let p = repo.progress_bytes("backing up...");
-
+    let p_upload = repo.progress_status("uploading");
     archiver.archive(
         src,
         &backup_paths[0],
@@ -346,6 +346,7 @@ where
         opts.parent_opts.skip_if_unchanged,
         opts.no_scan,
         &p,
+        &p_upload,
     )
 }
 

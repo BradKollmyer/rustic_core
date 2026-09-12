@@ -56,6 +56,17 @@ impl Progress {
         self.0.finish();
     }
 
+    /// Replace the progress message (status lines, upload counters).
+    pub fn set_message(&self, msg: &str) {
+        self.0.set_message(msg);
+    }
+
+    /// Update live new/changed file counts and unique source bytes packed.
+    pub fn set_upload_stats(&self, files_new: u64, files_changed: u64, bytes_added: u64) {
+        self.0
+            .set_upload_stats(files_new, files_changed, bytes_added);
+    }
+
     /// Report an error encountered while processing an item.
     ///
     /// # Arguments
@@ -99,6 +110,14 @@ pub trait RusticProgress: Send + Sync + 'static + std::fmt::Debug {
     /// Finish the progress
     fn finish(&self);
 
+    /// Replace the progress message. Default: ignore.
+    fn set_message(&self, _msg: &str) {}
+
+    /// Update live new/changed file counts and unique source bytes packed.
+    fn set_upload_stats(&self, files_new: u64, files_changed: u64, bytes_added: u64) {
+        self.set_message(&format_upload_stats(files_new, files_changed, bytes_added));
+    }
+
     /// Report an error encountered while processing an item.
     ///
     /// The default implementation logs a warning. JSON progress implementations
@@ -126,6 +145,17 @@ pub enum ProgressType {
     Counter,
     /// a progress which counts bytes
     Bytes,
+    /// a status line with a free-form message (backup upload counters)
+    Status,
+}
+
+/// Format live backup upload counters for progress lines.
+#[must_use]
+pub fn format_upload_stats(files_new: u64, files_changed: u64, bytes_added: u64) -> String {
+    format!(
+        "{files_new} new  {files_changed} changed  {} added",
+        bytesize::ByteSize(bytes_added)
+    )
 }
 
 /// Trait to start progress information report progress information for any rustic action which supports that.
@@ -152,6 +182,7 @@ impl RusticProgress for HiddenProgress {
     fn set_title(&self, _title: &str) {}
     fn inc(&self, _inc: u64) {}
     fn finish(&self) {}
+    fn set_message(&self, _msg: &str) {}
 }
 
 /// A dummy struct which shows no progress but only logs titles and end of a progress.
@@ -180,5 +211,18 @@ impl ProgressBars for NoProgressBars {
     fn progress(&self, _progress_type: ProgressType, prefix: &str) -> Progress {
         info!("{prefix}");
         Progress::new(NoProgress)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_upload_stats_matches_mock_a() {
+        let msg = format_upload_stats(41, 4, 892 * 1024 * 1024);
+        assert!(msg.starts_with("41 new  4 changed  "));
+        assert!(msg.ends_with(" added"));
+        assert!(msg.contains("MiB") || msg.contains("MB"));
     }
 }

@@ -168,7 +168,7 @@ pub use crate::{
     id::{HexId, Id},
     progress::{
         HiddenProgress, NoProgress, NoProgressBars, Progress, ProgressBars, ProgressType,
-        RusticProgress,
+        RusticProgress, format_upload_stats,
     },
     repofile::snapshotfile::{
         PathList, SnapshotOptions, StringList,

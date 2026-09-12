@@ -1,4 +1,6 @@
 use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     archiver::{
@@ -23,6 +25,55 @@ use crate::{
     progress::Progress,
     repofile::configfile::ConfigFile,
 };
+
+/// Live new/changed file counts for the backup "uploading" progress line.
+#[derive(Clone, Debug)]
+pub(crate) struct UploadStats {
+    p: Progress,
+    files_new: Arc<AtomicU64>,
+    files_changed: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+}
+
+impl UploadStats {
+    pub(crate) fn new(p: Progress) -> Self {
+        let stats = Self {
+            p,
+            files_new: Arc::new(AtomicU64::new(0)),
+            files_changed: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+        };
+        stats.refresh();
+        stats
+    }
+
+    fn note_file(&self, new: bool) {
+        if new {
+            _ = self.files_new.fetch_add(1, Ordering::Relaxed);
+        } else {
+            _ = self.files_changed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.refresh();
+    }
+
+    fn add_bytes(&self, n: u64) {
+        _ = self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.refresh();
+    }
+
+    fn refresh(&self) {
+        self.p.set_upload_stats(
+            self.files_new.load(Ordering::Relaxed),
+            self.files_changed.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        );
+    }
+
+    pub(crate) fn finish(&self) {
+        self.refresh();
+        self.p.finish();
+    }
+}
 
 /// The `FileArchiver` is responsible for archiving files.
 /// It will read the file, chunk it, and write the chunks to the backend.
@@ -98,6 +149,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         &self,
         item: ItemWithParent<Option<O>>,
         p: &Progress,
+        upload: &UploadStats,
     ) -> RusticResult<TreeItem> {
         Ok(match item {
             TreeType::NewTree(item) => TreeType::NewTree(item),
@@ -108,6 +160,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                     p.inc(size);
                     (node, size)
                 } else if node.node_type == NodeType::File {
+                    let new = matches!(parent, ParentResult::NotFound);
                     let r = open
                         .ok_or_else(
                             || RusticError::new(
@@ -125,7 +178,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                             .attach_context("path", path.display().to_string())
                         })?;
 
-                    self.backup_reader(r, node, p).map_err(|err| {
+                    self.backup_reader(r, node, p, upload, new).map_err(|err| {
                         err.prepend_guidance_line("Error while backing up `{path}`")
                             .attach_context("path", path.display().to_string())
                     })?
@@ -143,7 +196,10 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         r: impl Read + Send + 'static,
         node: Node,
         p: &Progress,
+        upload: &UploadStats,
+        new: bool,
     ) -> RusticResult<(Node, u64)> {
+        upload.note_file(new);
         let chunks: Vec<_> = ChunkIter::from_config(
             &self.config,
             r,
@@ -158,6 +214,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                 self.data_packer.add(chunk.into(), BlobId::from(id))?;
             }
             p.inc(size);
+            upload.add_bytes(size);
             Ok((DataId::from(id), size))
         })
         .collect::<RusticResult<_>>()?;

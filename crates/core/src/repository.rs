@@ -289,6 +289,15 @@ impl<S> Repository<S> {
         self.pb.progress(ProgressType::Bytes, prefix)
     }
 
+    /// Start a status line (backup upload counters).
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - The prefix of the progress
+    pub fn progress_status(&self, prefix: &str) -> Progress {
+        self.pb.progress(ProgressType::Status, prefix)
+    }
+
     /// Returns the Id of the config file
     ///
     /// # Errors
