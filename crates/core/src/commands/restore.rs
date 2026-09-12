@@ -582,7 +582,7 @@ fn restore_contents<S: Open>(
         .coalesce(PackInfo::coalesce)
         .collect();
 
-    let threads = constants::MAX_READER_THREADS_NUM;
+    let threads = restore_reader_threads(be.connection_limit());
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -848,5 +848,38 @@ impl RestorePlan {
             .map(|((pack, _), _)| *pack)
             .dedup()
             .collect()
+    }
+}
+
+fn restore_reader_threads(backend_limit: Option<usize>) -> usize {
+    backend_limit
+        .unwrap_or(constants::MAX_READER_THREADS_NUM)
+        .clamp(1, constants::MAX_READER_THREADS_NUM)
+}
+
+#[cfg(test)]
+mod restore_reader_threads_tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_backend_uses_max() {
+        assert_eq!(
+            restore_reader_threads(None),
+            constants::MAX_READER_THREADS_NUM
+        );
+    }
+
+    #[test]
+    fn honors_backend_limit() {
+        assert_eq!(restore_reader_threads(Some(5)), 5);
+        assert_eq!(restore_reader_threads(Some(1)), 1);
+    }
+
+    #[test]
+    fn caps_at_max_reader_threads() {
+        assert_eq!(
+            restore_reader_threads(Some(64)),
+            constants::MAX_READER_THREADS_NUM
+        );
     }
 }

@@ -59,6 +59,7 @@ storj = [
   "dep:backon",
   "tokio/rt-multi-thread",
   "tokio/io-util",
+  "tokio/sync",
 ]
 
 [dependencies]

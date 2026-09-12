@@ -1,11 +1,12 @@
 //! Native Storj Uplink backend for rustic.
-use std::{collections::BTreeMap, future::Future, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, future::Future, str::FromStr, sync::Arc, time::Duration};
 
 use backon::{BlockingRetryable, ExponentialBuilder};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
 use rustic_core::{
     BytesList, CommandInput, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult,
@@ -18,6 +19,13 @@ use crate::util::BackendLocation;
 mod constants {
     /// Default number of retries for transient Storj errors.
     pub(super) const DEFAULT_RETRY: usize = 5;
+    /// Concurrent Storj object downloads/uploads. Restore otherwise opens 20
+    /// pack reads, each fanning out to ~k+1 storage nodes.
+    pub(super) const DEFAULT_CONNECTIONS: usize = 5;
+    /// Per-read/write SN deadline. SDK default is 10 minutes; a silent node
+    /// then stalls long-tail until that expires. 20s is enough for a 64 KiB
+    /// read and lets the next piece start.
+    pub(super) const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 20;
 }
 
 /// Native Storj backend.
@@ -31,6 +39,8 @@ pub struct StorjBackend {
     /// Object-key prefix, empty or ending with `/`.
     prefix: String,
     backoff: ExponentialBuilder,
+    connections: usize,
+    io_limit: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for StorjBackend {
@@ -38,6 +48,7 @@ impl std::fmt::Debug for StorjBackend {
         f.debug_struct("StorjBackend")
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
+            .field("connections", &self.connections)
             .finish_non_exhaustive()
     }
 }
@@ -64,9 +75,15 @@ impl StorjBackend {
             .cloned()
             .unwrap_or_else(|| "rustic".to_string());
         let transport = parse_transport(&options)?;
+        let connections = parse_connections(&options)?;
+        let message_timeout = parse_message_timeout(&options)?;
+        let download_hedge_delay = parse_download_hedge_delay(&options)?;
         let config = storj::Config {
             user_agent: Some(user_agent),
             transport,
+            message_timeout: Some(message_timeout),
+            download_hedge_delay,
+            concurrent_segments: Some(connections),
             ..storj::Config::default()
         };
 
@@ -81,6 +98,8 @@ impl StorjBackend {
             bucket,
             prefix,
             backoff,
+            connections,
+            io_limit: Arc::new(Semaphore::new(connections)),
         })
     }
 
@@ -104,7 +123,13 @@ impl StorjBackend {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, storj::Error>>,
     {
-        self.retry(|| runtime().block_on(op()))
+        let io_limit = Arc::clone(&self.io_limit);
+        self.retry(|| {
+            let _permit = runtime()
+                .block_on(io_limit.acquire())
+                .expect("Storj I/O semaphore closed");
+            runtime().block_on(op())
+        })
     }
 }
 
@@ -270,6 +295,75 @@ fn parse_transport(options: &BTreeMap<String, String>) -> RusticResult<storj::Tr
     }
 }
 
+fn parse_connections(options: &BTreeMap<String, String>) -> RusticResult<usize> {
+    match options.get("connections") {
+        None => Ok(constants::DEFAULT_CONNECTIONS),
+        Some(value) => {
+            let connections = usize::from_str(value).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InvalidInput,
+                    "Cannot parse value `{value}`, invalid value for option `{option}`.",
+                    err,
+                )
+                .attach_context("value", value.clone())
+                .attach_context("option", "connections")
+            })?;
+            if connections == 0 {
+                return Err(RusticError::new(
+                    ErrorKind::InvalidInput,
+                    "Backend connections must be greater than zero.",
+                ));
+            }
+            Ok(connections)
+        }
+    }
+}
+
+fn parse_message_timeout(options: &BTreeMap<String, String>) -> RusticResult<Duration> {
+    match options.get("message-timeout") {
+        None => Ok(Duration::from_secs(constants::DEFAULT_MESSAGE_TIMEOUT_SECS)),
+        Some(value) => {
+            let secs = u64::from_str(value).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InvalidInput,
+                    "Cannot parse value `{value}`, invalid value for option `{option}`.",
+                    err,
+                )
+                .attach_context("value", value.clone())
+                .attach_context("option", "message-timeout")
+            })?;
+            if secs == 0 {
+                return Err(RusticError::new(
+                    ErrorKind::InvalidInput,
+                    "Storj `message-timeout` must be greater than zero seconds.",
+                ));
+            }
+            Ok(Duration::from_secs(secs))
+        }
+    }
+}
+
+fn parse_download_hedge_delay(
+    options: &BTreeMap<String, String>,
+) -> RusticResult<Option<Duration>> {
+    options
+        .get("download-hedge-delay")
+        .map(|value| {
+            u64::from_str(value)
+                .map(Duration::from_secs)
+                .map_err(|err| {
+                    RusticError::with_source(
+                        ErrorKind::InvalidInput,
+                        "Cannot parse value `{value}`, invalid value for option `{option}`.",
+                        err,
+                    )
+                    .attach_context("value", value.clone())
+                    .attach_context("option", "download-hedge-delay")
+                })
+        })
+        .transpose()
+}
+
 fn parse_retry(options: &BTreeMap<String, String>) -> RusticResult<ExponentialBuilder> {
     let mut backoff = ExponentialBuilder::default()
         .with_max_delay(Duration::MAX)
@@ -331,6 +425,10 @@ fn id_from_object_key(key: &str, tpe: FileType) -> Option<Id> {
 }
 
 impl ReadBackend for StorjBackend {
+    fn connection_limit(&self) -> Option<usize> {
+        Some(self.connections)
+    }
+
     fn location(&self) -> String {
         if self.prefix.is_empty() {
             format!("storj:{}", self.bucket)
@@ -577,6 +675,69 @@ mod tests {
         let mut options = BTreeMap::new();
         _ = options.insert("transport".into(), "udp".into());
         assert!(parse_transport(&options).is_err());
+    }
+
+    #[test]
+    fn parse_connections_defaults_to_five() {
+        assert_eq!(
+            parse_connections(&BTreeMap::new()).unwrap(),
+            constants::DEFAULT_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn parse_connections_accepts_positive() {
+        let mut options = BTreeMap::new();
+        _ = options.insert("connections".into(), "3".into());
+        assert_eq!(parse_connections(&options).unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_connections_rejects_zero() {
+        let mut options = BTreeMap::new();
+        _ = options.insert("connections".into(), "0".into());
+        assert!(parse_connections(&options).is_err());
+    }
+
+    #[test]
+    fn parse_message_timeout_defaults_to_twenty_seconds() {
+        assert_eq!(
+            parse_message_timeout(&BTreeMap::new()).unwrap(),
+            Duration::from_secs(constants::DEFAULT_MESSAGE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn parse_message_timeout_accepts_seconds() {
+        let mut options = BTreeMap::new();
+        _ = options.insert("message-timeout".into(), "45".into());
+        assert_eq!(
+            parse_message_timeout(&options).unwrap(),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn parse_message_timeout_rejects_zero() {
+        let mut options = BTreeMap::new();
+        _ = options.insert("message-timeout".into(), "0".into());
+        assert!(parse_message_timeout(&options).is_err());
+    }
+
+    #[test]
+    fn parse_download_hedge_delay_supports_default_override_and_disable() {
+        assert_eq!(parse_download_hedge_delay(&BTreeMap::new()).unwrap(), None);
+        for (value, expected) in [("0", 0), ("2", 2)] {
+            let options = BTreeMap::from([("download-hedge-delay".into(), value.into())]);
+            assert_eq!(
+                parse_download_hedge_delay(&options).unwrap(),
+                Some(Duration::from_secs(expected))
+            );
+        }
+        for value in ["-1", "abc", "1.5"] {
+            let options = BTreeMap::from([("download-hedge-delay".into(), value.into())]);
+            assert!(parse_download_hedge_delay(&options).is_err());
+        }
     }
 
     #[test]
