@@ -37,14 +37,12 @@ pub(crate) struct UploadStats {
 
 impl UploadStats {
     pub(crate) fn new(p: Progress) -> Self {
-        let stats = Self {
+        Self {
             p,
             files_new: Arc::new(AtomicU64::new(0)),
             files_changed: Arc::new(AtomicU64::new(0)),
             bytes: Arc::new(AtomicU64::new(0)),
-        };
-        stats.refresh();
-        stats
+        }
     }
 
     fn note_file(&self, new: bool) {
@@ -70,6 +68,12 @@ impl UploadStats {
     }
 
     pub(crate) fn finish(&self) {
+        if self.files_new.load(Ordering::Relaxed) == 0
+            && self.files_changed.load(Ordering::Relaxed) == 0
+            && self.bytes.load(Ordering::Relaxed) == 0
+        {
+            return;
+        }
         self.refresh();
         self.p.finish();
     }
@@ -199,7 +203,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         upload: &UploadStats,
         new: bool,
     ) -> RusticResult<(Node, u64)> {
-        upload.note_file(new);
+        let mut counted = false;
         let chunks: Vec<_> = ChunkIter::from_config(
             &self.config,
             r,
@@ -212,9 +216,13 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
 
             if !self.index.has_data(&DataId::from(id)) {
                 self.data_packer.add(chunk.into(), BlobId::from(id))?;
+                if !counted {
+                    upload.note_file(new);
+                    counted = true;
+                }
+                upload.add_bytes(size);
             }
             p.inc(size);
-            upload.add_bytes(size);
             Ok((DataId::from(id), size))
         })
         .collect::<RusticResult<_>>()?;
