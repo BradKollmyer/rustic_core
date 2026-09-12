@@ -63,8 +63,10 @@ impl StorjBackend {
             .get("user-agent")
             .cloned()
             .unwrap_or_else(|| "rustic".to_string());
+        let transport = parse_transport(&options)?;
         let config = storj::Config {
             user_agent: Some(user_agent),
+            transport,
             ..storj::Config::default()
         };
 
@@ -244,6 +246,30 @@ pub(crate) fn object_key(prefix: &str, tpe: FileType, id: &Id) -> String {
     format!("{prefix}{rel}")
 }
 
+/// Storj wire transport.
+///
+/// The `storj` crate and restic's Go uplink both default to Noise for
+/// storage-node transfers. `tcp` / `quic` / `auto` override that. `auto`
+/// races QUIC then TCP/TLS and does not use Noise. Network extras (early
+/// data, Fast Open, QoS) stay on crate/Go defaults.
+fn parse_transport(options: &BTreeMap<String, String>) -> RusticResult<storj::TransportMode> {
+    let Some(value) = options.get("transport") else {
+        return Ok(storj::TransportMode::Noise);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(storj::TransportMode::Tcp),
+        "quic" => Ok(storj::TransportMode::Quic),
+        "auto" => Ok(storj::TransportMode::Auto),
+        "noise" => Ok(storj::TransportMode::Noise),
+        _ => Err(RusticError::new(
+            ErrorKind::InvalidInput,
+            "Invalid value `{value}` for option `{option}`. Allowed: tcp, quic, auto, noise.",
+        )
+        .attach_context("value", value.clone())
+        .attach_context("option", "transport")),
+    }
+}
+
 fn parse_retry(options: &BTreeMap<String, String>) -> RusticResult<ExponentialBuilder> {
     let mut backoff = ExponentialBuilder::default()
         .with_max_delay(Duration::MAX)
@@ -373,6 +399,7 @@ impl ReadBackend for StorjBackend {
             &storj::DownloadOptions {
                 offset: i64::from(offset),
                 length: i64::from(length),
+                ..storj::DownloadOptions::default()
             },
         )
     }
@@ -520,6 +547,36 @@ mod tests {
     #[test]
     fn parse_empty_location_needs_bucket_option() {
         assert!(parse_bucket_and_prefix("", &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn parse_transport_defaults_to_noise() {
+        assert_eq!(
+            parse_transport(&BTreeMap::new()).unwrap(),
+            storj::TransportMode::Noise
+        );
+    }
+
+    #[test]
+    fn parse_transport_values() {
+        for (value, expected) in [
+            ("tcp", storj::TransportMode::Tcp),
+            ("TCP", storj::TransportMode::Tcp),
+            ("quic", storj::TransportMode::Quic),
+            ("auto", storj::TransportMode::Auto),
+            ("noise", storj::TransportMode::Noise),
+        ] {
+            let mut options = BTreeMap::new();
+            _ = options.insert("transport".into(), value.into());
+            assert_eq!(parse_transport(&options).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn parse_transport_rejects_unknown() {
+        let mut options = BTreeMap::new();
+        _ = options.insert("transport".into(), "udp".into());
+        assert!(parse_transport(&options).is_err());
     }
 
     #[test]
