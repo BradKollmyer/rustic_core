@@ -349,3 +349,44 @@ fn test_backup_unreadable_file_sets_error_count(set_up_repo: Result<RepoOpen>) -
 
     Ok(())
 }
+
+#[rstest]
+fn test_backup_vanished_directory_completes(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir()?;
+    let base = tmp.path();
+    fs::write(base.join("keep.txt"), "keep")?;
+    let vanished = base.join("__pycache__");
+    fs::create_dir(&vanished)?;
+    fs::write(vanished.join("foo.pyc"), "pyc")?;
+    // Extra files so the walk is still going when the dir is removed.
+    for i in 0..32 {
+        fs::write(base.join(format!("file-{i:02}.txt")), format!("data-{i}"))?;
+    }
+
+    let vanished_for_thread = vanished.clone();
+    let deleter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        let _ = fs::remove_dir_all(&vanished_for_thread);
+    });
+
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let paths = PathList::from_iter(Some(base.to_path_buf()));
+    let opts = BackupOptions::default()
+        .as_path(PathBuf::from("test"))
+        .parallel_uploads(true);
+    let snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    deleter.join().expect("deleter thread should not panic");
+
+    let summary = snapshot.summary.as_ref().expect("backup sets a summary");
+    assert_ne!(snapshot.id, SnapshotFile::default().id);
+    assert!(
+        summary.total_files_processed >= 1,
+        "expected keep.txt (and siblings) to be backed up"
+    );
+
+    Ok(())
+}

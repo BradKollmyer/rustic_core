@@ -266,9 +266,10 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             })
             .try_for_each(|item| self.tree_archiver.add(item))?;
 
-            src_size_handle
-                .join()
-                .expect("Scoped Size Handler thread should not panic!");
+            if src_size_handle.join().is_err() {
+                // Don't fail the backup if the parallel size scan panics.
+                warn!("backup size scan thread panicked; continuing without a total size");
+            }
 
             Ok(())
         });

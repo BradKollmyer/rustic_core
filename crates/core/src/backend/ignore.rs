@@ -4,13 +4,14 @@ pub use mapper::LocalSourceSaveOptions;
 use std::{
     ffi::OsString,
     fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
 use bytesize::ByteSize;
 use derive_setters::Setters;
 use ignore::{Walk, WalkBuilder};
-use log::warn;
+use log::{debug, warn};
 use serde_with::{DisplayFromStr, serde_as};
 
 #[cfg(not(windows))]
@@ -29,12 +30,12 @@ pub enum IgnoreErrorKind {
     /// Error getting xattrs for `{path:?}`: `{source:?}`
     ErrorXattr {
         path: PathBuf,
-        source: std::io::Error,
+        source: io::Error,
     },
     /// Error reading link target for `{path:?}`: `{source:?}`
     ErrorLink {
         path: PathBuf,
-        source: std::io::Error,
+        source: io::Error,
     },
     #[cfg(not(windows))]
     /// Error converting ctime `{ctime}` and `ctime_nsec` `{ctime_nsec}` to Utc Timestamp: `{source:?}`
@@ -261,10 +262,14 @@ impl ReadSource for LocalSource {
     fn size(&self) -> RusticResult<Option<u64>> {
         let mut size = 0;
         for entry in self.builder.build() {
-            if let Err(err) = entry.and_then(|e| e.metadata()).map(|m| {
-                size += if m.is_dir() { 0 } else { m.len() };
-            }) {
-                warn!("ignoring error {err}");
+            match entry.and_then(|e| e.metadata()) {
+                Ok(m) => size += if m.is_dir() { 0 } else { m.len() },
+                // Vanished paths during the parallel size scan are expected.
+                // Don't warn: that log can freeze the backup progress bar.
+                Err(err) if ignore_error_is_not_found(&err) => {
+                    debug!("skipping vanished source path during size scan: {err}");
+                }
+                Err(err) => warn!("ignoring error {err}"),
             }
         }
         Ok(Some(size))
@@ -294,6 +299,11 @@ fn ignore_error_path(err: &ignore::Error) -> Option<String> {
     }
 }
 
+fn ignore_error_is_not_found(err: &ignore::Error) -> bool {
+    err.io_error()
+        .is_some_and(|io_err| io_err.kind() == io::ErrorKind::NotFound)
+}
+
 // Walk doesn't implement Debug
 #[allow(missing_debug_implementations)]
 pub struct LocalSourceWalker {
@@ -307,43 +317,127 @@ impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.walker.next() {
-            // ignore root dir, i.e. an entry with depth 0 of type dir
-            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
-                self.walker.next()
-            }
-            item => item,
-        }
-        .map(|e| {
-            let entry = e.map_err(|err| {
-                let path = ignore_error_path(&err);
-                let rustic_err = if path.is_some() {
-                    RusticError::with_source(
-                        ErrorKind::InputOutput,
-                        "Failed to read source path `{path}`.",
-                        err,
-                    )
-                } else {
-                    RusticError::with_source(
-                        ErrorKind::InputOutput,
-                        "Failed to read source path.",
-                        err,
-                    )
-                };
-                match path {
-                    Some(path) => rustic_err.attach_context("path", path),
-                    None => rustic_err,
+        loop {
+            match self.walker.next()? {
+                // ignore root dir, i.e. an entry with depth 0 of type dir
+                Ok(entry) if entry.depth() == 0 && entry.file_type().is_some_and(|t| t.is_dir()) => {
+                    continue;
                 }
-            })?;
-            let path = entry.path().display().to_string();
-            self.save_opts.map_entry(entry).map_err(|err| {
+                item => return Some(self.map_walk_item(item)),
+            }
+        }
+    }
+}
+
+impl LocalSourceWalker {
+    fn map_walk_item(
+        &self,
+        e: Result<ignore::DirEntry, ignore::Error>,
+    ) -> RusticResult<ReadSourceEntry<OpenFile>> {
+        let entry = e.map_err(|err| {
+            let path = ignore_error_path(&err);
+            let rustic_err = if path.is_some() {
                 RusticError::with_source(
                     ErrorKind::InputOutput,
-                    "Failed to map directory entry `{path}` to a backup source entry.",
+                    "Failed to read source path `{path}`.",
                     err,
                 )
-                .attach_context("path", path)
-            })
+            } else {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to read source path.",
+                    err,
+                )
+            };
+            match path {
+                Some(path) => rustic_err.attach_context("path", path),
+                None => rustic_err,
+            }
+        })?;
+        let path = entry.path().display().to_string();
+        self.save_opts.map_entry(entry).map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Failed to map directory entry `{path}` to a backup source entry.",
+                err,
+            )
+            .attach_context("path", path)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::tree::excludes::Excludes;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    fn source(base: &Path) -> LocalSource {
+        LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[base],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ignore_io_not_found_is_detected() {
+        let err = ignore::Error::Io(io::Error::from(io::ErrorKind::NotFound));
+        assert!(ignore_error_is_not_found(&err));
+        let wrapped = ignore::Error::WithPath {
+            path: PathBuf::from("/tmp/__pycache__"),
+            err: Box::new(err),
+        };
+        assert!(ignore_error_is_not_found(&wrapped));
+        assert!(!ignore_error_is_not_found(&ignore::Error::Io(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )));
+    }
+
+    #[test]
+    fn size_scan_succeeds_after_directory_vanishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        fs::write(base.join("keep.txt"), "keep").unwrap();
+        let vanished = base.join("__pycache__");
+        fs::create_dir(&vanished).unwrap();
+        fs::write(vanished.join("foo.pyc"), "pyc").unwrap();
+
+        let src = source(base);
+        fs::remove_dir_all(&vanished).unwrap();
+
+        let size = src.size().unwrap().expect("size scan returns a total");
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn entries_walk_continues_after_directory_deleted_mid_iteration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // `0.txt` sorts before `__pycache__` so we can delete the dir after
+        // the walk has started but before it descends into it.
+        fs::write(base.join("0.txt"), "zero").unwrap();
+        let vanished = base.join("__pycache__");
+        fs::create_dir(&vanished).unwrap();
+        fs::write(vanished.join("foo.pyc"), "pyc").unwrap();
+        fs::write(base.join("keep.txt"), "keep").unwrap();
+
+        let src = source(base);
+        let mut iter = src.entries();
+        let first = iter.next().expect("walker yields 0.txt");
+        assert!(first.is_ok(), "{first:?}");
+        fs::remove_dir_all(&vanished).unwrap();
+
+        let rest: Vec<_> = iter.collect();
+        assert!(
+            rest.iter()
+                .any(|item| item.as_ref().is_ok_and(|e| e.path.ends_with("keep.txt"))),
+            "walk should continue after a vanished directory, got {rest:?}"
+        );
     }
 }
