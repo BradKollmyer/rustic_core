@@ -144,3 +144,56 @@ The command above records this run; use a fresh destination for another timing.
 The restored files and full log remain under
 `/Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/`.
 The updated SDK has not been deployed to arc.
+
+## OpenDAL S3 gateway full-day comparison, 2026-09-12
+
+The same snapshot `59bff332` and complete `2026-08-31` directory were restored
+through `opendal:s3`, bucket `photos`, endpoint `https://gateway.storjshare.io`.
+This used the same Mac and benchmark binary, five connections, the same warm
+metadata cache, `--no-ownership`, and an open-file limit of 8192. The destination
+was fresh, and restore file-data range reads bypass the disk cache. This was a
+read-only operation against the repository.
+
+| | Earlier native | Native with hedging | OpenDAL S3 gateway |
+|---|---:|---:|---:|
+| Wall time | 79.13 min | 19.19 min | 11.49 min |
+| Wall seconds | 4,748 | 1,151.26 | 689.17 |
+| Payload throughput | 3.03 MiB/s | 12.51 MiB/s | 20.91 MiB/s |
+| Exit status | 0 | 0 | 0 |
+
+OpenDAL was **1.67× faster than updated native**, taking **40.1% less time**
+and saving **7.70 minutes**. It was 6.89× faster than the earlier native run.
+All runs restored 814 files totaling 15,107,783,814 bytes (14.07 GiB).
+`diff -rq` compared the OpenDAL output against the verified native-with-hedging
+output and exited 0 with no differences: all file contents match byte for byte.
+
+The OpenDAL run started at 20:50:26 UTC, shortly after the updated native run
+finished at 20:43:59 UTC. Two truncated S3 responses triggered automatic retries
+(`end of file before message length reached`); both recovered, and the timing
+includes them. These are sequential single-run measurements, not simultaneous
+or repeated controls. Network conditions and gateway-side caching can vary;
+the result does not establish a universal throughput ratio.
+
+The existing profile supplies S3 credentials without putting them in the command
+line or this report. The command was:
+
+```sh
+ulimit -n 8192
+/usr/bin/time -p \
+  -o /Users/bradk/repos/rustic/restore/photos-opendal.r7vKVc/wall-time.txt \
+  ./target-darwin-dbg/release/rustic \
+  -P /Users/bradk/.config/rustic/photos-opendal \
+  --cache-dir /private/tmp/rustic-storj-perf.S9fUcA/cache \
+  restore 59bff332:/var/mnt/photos/2026-08-31 \
+  /Users/bradk/repos/rustic/restore/photos-opendal.r7vKVc/2026-08-31 \
+  --no-ownership \
+  --log-file /Users/bradk/repos/rustic/restore/photos-opendal.r7vKVc/full-day.log \
+  --json-progress --progress-interval 30s
+
+diff -rq \
+  /Users/bradk/repos/rustic/restore/photos-hedged.r9h5lJ/2026-08-31 \
+  /Users/bradk/repos/rustic/restore/photos-opendal.r7vKVc/2026-08-31
+```
+
+The restored files, log and wall-time output remain under
+`/Users/bradk/repos/rustic/restore/photos-opendal.r7vKVc/`.
