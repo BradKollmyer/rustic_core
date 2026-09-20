@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
 };
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 use crate::{
     backend::{BytesList, FileType, ReadBackend, WriteBackend},
-    error::{ErrorKind, RusticError, RusticResult},
+    error::{ErrorKind, RusticError, RusticResult, io_error_is_too_many_open_files},
     id::Id,
     repofile::configfile::RepositoryId,
 };
@@ -28,13 +28,57 @@ mod constants {
     pub(super) const OPEN_FILE_CAPACITY: usize = 2048;
     /// Minimum descriptors left for sockets, index files, and other I/O.
     pub(super) const OPEN_FILE_RESERVE: u64 = 64;
+    /// Soft limits at or below this keep at most a quarter of descriptors in the pack cache.
+    /// Half of 1024 left too little for source walks, file workers, and backend sockets.
+    pub(super) const SMALL_NOFILE_LIMIT: u64 = 1024;
 }
 
 type OpenFileCache = quick_cache::sync::Cache<Id, Arc<CachedFile>>;
 
-/// Keep at most half the descriptor limit in the pack cache. Parallel index
-/// writes and pooled HTTP sockets outlive individual pack reads, so a fixed
-/// 64-descriptor reserve alone can exhaust a Linux 1024-descriptor limit.
+static OPEN_FILE_CACHES: Mutex<Vec<Weak<OpenFileCache>>> = Mutex::new(Vec::new());
+
+fn register_open_file_cache(cache: &Arc<OpenFileCache>) {
+    let Ok(mut list) = OPEN_FILE_CACHES.lock() else {
+        return;
+    };
+    list.retain(|w| w.strong_count() > 0);
+    list.push(Arc::downgrade(cache));
+}
+
+/// Drop cached pack file descriptors so source `opendir`/`open` can proceed.
+///
+/// Pack FDs are a performance cache. Source directory FDs are not optional:
+/// skipping a tree on EMFILE omits it from the snapshot.
+pub(crate) fn release_cached_open_files() {
+    let Ok(mut list) = OPEN_FILE_CACHES.lock() else {
+        return;
+    };
+    list.retain(|w| w.strong_count() > 0);
+    for cache in list.iter().filter_map(Weak::upgrade) {
+        cache.clear();
+    }
+}
+
+/// Retry `op` after dropping cached pack FDs when it fails with EMFILE/ENFILE.
+pub(crate) fn retry_on_too_many_open_files<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const RETRIES: u8 = 2;
+    let mut tries = 0;
+    loop {
+        match op() {
+            Err(err) if io_error_is_too_many_open_files(&err) && tries < RETRIES => {
+                release_cached_open_files();
+                tries += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Keep cached pack FDs well under the process limit. Parallel index writes,
+/// source walks, file workers, and pooled sockets share the same table; a
+/// 64-descriptor reserve (and even half of 1024) can leave `opendir` with nothing.
 fn open_file_capacity() -> usize {
     #[cfg(unix)]
     if let Ok((soft, _)) =
@@ -48,7 +92,12 @@ fn open_file_capacity() -> usize {
 
 fn open_file_capacity_from_soft_limit(soft: impl Into<u64>) -> usize {
     let soft = soft.into();
-    usize::try_from((soft / 2).min(soft.saturating_sub(constants::OPEN_FILE_RESERVE)))
+    let fraction = if soft <= constants::SMALL_NOFILE_LIMIT {
+        4
+    } else {
+        2
+    };
+    usize::try_from((soft / fraction).min(soft.saturating_sub(constants::OPEN_FILE_RESERVE)))
         .unwrap_or(usize::MAX)
         .clamp(1, constants::OPEN_FILE_CAPACITY)
 }
@@ -56,7 +105,7 @@ fn open_file_capacity_from_soft_limit(soft: impl Into<u64>) -> usize {
 struct CachedFile {
     file: File,
     #[cfg(any(test, not(unix)))]
-    seek_lock: std::sync::Mutex<()>,
+    seek_lock: Mutex<()>,
 }
 
 impl CachedFile {
@@ -64,7 +113,7 @@ impl CachedFile {
         Self {
             file,
             #[cfg(any(test, not(unix)))]
-            seek_lock: std::sync::Mutex::new(()),
+            seek_lock: Mutex::new(()),
         }
     }
 
@@ -94,24 +143,6 @@ impl CachedFile {
         _ = file.seek(SeekFrom::Start(u64::from(offset)))?;
         file.read_exact(&mut vec)?;
         Ok(vec.into())
-    }
-}
-
-fn is_too_many_open_files(err: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        // POSIX EMFILE / ENFILE. Do not treat 4 as a match: that is EINTR.
-        matches!(err.raw_os_error(), Some(24 | 23))
-    }
-    #[cfg(windows)]
-    {
-        // ERROR_TOO_MANY_OPEN_FILES
-        err.raw_os_error() == Some(4)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = err;
-        false
     }
 }
 
@@ -477,10 +508,9 @@ impl Cache {
             .attach_context("id", id.to_string())
         })?;
 
-        Ok(Self {
-            path,
-            open_files: Arc::new(OpenFileCache::new(open_file_capacity())),
-        })
+        let open_files = Arc::new(OpenFileCache::new(open_file_capacity()));
+        register_open_file_cache(&open_files);
+        Ok(Self { path, open_files })
     }
 
     /// True if at least one pack file is already in this cache.
@@ -713,19 +743,16 @@ impl Cache {
             return Ok(Some(file));
         }
 
-        match File::open(path) {
+        match retry_on_too_many_open_files(|| File::open(path)) {
             Ok(file) => Ok(Some(self.remember_open(id, file))),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) if is_too_many_open_files(&err) => {
-                self.open_files.clear();
-                match File::open(path) {
-                    Ok(file) => Ok(Some(self.remember_open(id, file))),
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-                    Err(err) => Err(err),
-                }
-            }
             Err(err) => Err(err),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_file_count(&self) -> usize {
+        self.open_files.len()
     }
 
     fn remember_open(&self, id: &Id, file: File) -> Arc<CachedFile> {
@@ -1041,11 +1068,64 @@ mod tests {
     fn open_file_capacity_leaves_headroom_for_parallel_io() {
         assert_eq!(open_file_capacity_from_soft_limit(8192_u64), 2048);
         assert_eq!(open_file_capacity_from_soft_limit(4096_u64), 2048);
-        assert_eq!(open_file_capacity_from_soft_limit(1024_u64), 512);
-        assert_eq!(open_file_capacity_from_soft_limit(256_u64), 128);
-        assert_eq!(open_file_capacity_from_soft_limit(96_u64), 32);
+        assert_eq!(open_file_capacity_from_soft_limit(1024_u64), 256);
+        assert_eq!(open_file_capacity_from_soft_limit(256_u64), 64);
+        assert_eq!(open_file_capacity_from_soft_limit(96_u64), 24);
         assert_eq!(open_file_capacity_from_soft_limit(64_u64), 1);
         assert_eq!(open_file_capacity_from_soft_limit(0_u64), 1);
+    }
+
+    fn too_many_open_files_error() -> io::Error {
+        #[cfg(windows)]
+        {
+            io::Error::from_raw_os_error(4)
+        }
+        #[cfg(not(windows))]
+        {
+            io::Error::from_raw_os_error(24)
+        }
+    }
+
+    #[test]
+    fn retry_on_too_many_open_files_retries_after_release() {
+        let mut n = 0;
+        let result = retry_on_too_many_open_files(|| {
+            n += 1;
+            if n == 1 {
+                Err(too_many_open_files_error())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn retry_on_too_many_open_files_gives_up() {
+        let mut n = 0;
+        let result = retry_on_too_many_open_files(|| {
+            n += 1;
+            Err::<(), _>(too_many_open_files_error())
+        });
+        assert!(io_error_is_too_many_open_files(&result.unwrap_err()));
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn release_cached_open_files_drops_pack_fds() {
+        let (_dir, cache) = new_cache();
+        let id = Id::random();
+        cache
+            .write_bytes(FileType::Pack, &id, &vec![0_u8; 16].into())
+            .unwrap();
+        _ = cache
+            .read_partial(FileType::Pack, &id, 0, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.open_files.len(), 1);
+        release_cached_open_files();
+        assert_eq!(cache.open_files.len(), 0);
     }
 
     #[cfg(unix)]
