@@ -1,6 +1,9 @@
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use log::info;
 
 use crate::{
     archiver::{
@@ -25,6 +28,17 @@ use crate::{
     progress::Progress,
     repofile::configfile::ConfigFile,
 };
+
+/// Prints a new or changed path at info when backup starts copying it.
+/// Unchanged paths stay at debug so a large incremental walk does not list them.
+fn log_copied_file(dir: &Path, node: &Node, new: bool) {
+    let filename = dir.join(node.name());
+    if new {
+        info!("new       file: {}", filename.display());
+    } else {
+        info!("changed   file: {}", filename.display());
+    }
+}
 
 /// Live new/changed file counts for the backup "uploading" progress line.
 #[derive(Clone, Debug)]
@@ -159,6 +173,9 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             TreeType::NewTree(item) => TreeType::NewTree(item),
             TreeType::EndTree => TreeType::EndTree,
             TreeType::Other((path, node, (open, parent))) => {
+                if !matches!(parent, ParentResult::Matched(())) {
+                    log_copied_file(&path, &node, matches!(parent, ParentResult::NotFound));
+                }
                 let (node, filesize) = if matches!(parent, ParentResult::Matched(())) {
                     let size = node.meta.size;
                     p.inc(size);
@@ -246,5 +263,67 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// * If the channel could not be dropped
     pub(crate) fn finalize(self) -> RusticResult<PackerStats> {
         self.data_packer.finalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsStr,
+        path::Path,
+        sync::{Mutex, OnceLock},
+    };
+
+    use super::log_copied_file;
+    use crate::backend::node::{Metadata, Node, NodeType};
+
+    struct Capture {
+        lines: Mutex<Vec<String>>,
+    }
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.lines.lock().unwrap().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn capture() -> &'static Capture {
+        static LOGGER: OnceLock<Capture> = OnceLock::new();
+        let logger = LOGGER.get_or_init(|| Capture {
+            lines: Mutex::new(Vec::new()),
+        });
+        _ = log::set_logger(logger);
+        logger
+    }
+
+    #[test]
+    fn logs_new_and_changed_paths_when_copy_starts() {
+        let logger = capture();
+        let previous = log::max_level();
+        log::set_max_level(log::LevelFilter::Info);
+        let node = Node::new_node(OsStr::new("photo.cr3"), NodeType::File, Metadata::default());
+        log_copied_file(Path::new("/var/mnt/photos"), &node, true);
+        log_copied_file(Path::new("/var/mnt/photos"), &node, false);
+        log::set_max_level(previous);
+
+        let lines = logger.lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "new       file: /var/mnt/photos/photo.cr3")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "changed   file: /var/mnt/photos/photo.cr3")
+        );
     }
 }

@@ -136,11 +136,9 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> TreeArchiver<'a, BE, I> {
                 self.summary.files_unmodified += 1;
             }
             ParentResult::NotMatched => {
-                debug!("changed   file: {}", filename.display());
                 self.summary.files_changed += 1;
             }
             ParentResult::NotFound => {
-                debug!("new       file: {}", filename.display());
                 self.summary.files_new += 1;
             }
         }
