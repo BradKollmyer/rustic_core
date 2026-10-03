@@ -18,7 +18,7 @@ not included in the pasted text were not assessed.
 ## Boundaries
 
 The Storj root-workspace patch points to
-`https://github.com/BradKollmyer/storj-uplink.git` at
+`https://github.com/BradKollmyer/uplink-rs.git` at
 `f4e5374e524da86dcd4cde38c302813df173dba9`. A default backend build was verified
 from a clean detached checkout using the committed lockfile and Git dependency,
 without the local Storj checkout. Before publishing crates, select a crates.io
